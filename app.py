@@ -1,4 +1,5 @@
 import datetime as dt
+from zoneinfo import ZoneInfo
 import io
 import json
 import os
@@ -27,6 +28,13 @@ SCANNER = Path("exec_8k_scanner.py")
 # ----------
 # Helpers
 # ----------
+
+
+def today_chicago() -> dt.date:
+    try:
+        return dt.datetime.now(ZoneInfo("America/Chicago")).date()
+    except Exception:
+        return dt.date.today()
 
 def parse_tickers(text: str) -> List[str]:
     """Parse tickers from a free-form blob (newlines/commas/spaces; supports # comments)."""
@@ -59,7 +67,7 @@ def get_user_agent() -> str:
     return (ua or os.environ.get("SEC_USER_AGENT", "")).strip()
 
 
-def run_scan(tickers: List[str], position: str, lookback_days: int, max_rps: int) -> Tuple[int, str, str]:
+def run_scan(tickers: List[str], position: str, lookback_days: int, as_of_date: dt.date, max_rps: int) -> Tuple[int, str, str]:
     """Run the scanner as a subprocess. Returns (exit_code, stdout, stderr)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -93,6 +101,8 @@ def run_scan(tickers: List[str], position: str, lookback_days: int, max_rps: int
             position,
             "--lookback-days",
             str(int(lookback_days)),
+            "--as-of",
+            as_of_date.isoformat(),
             "--out-csv",
             str(out_csv),
             "--out-jsonl",
@@ -105,11 +115,11 @@ def run_scan(tickers: List[str], position: str, lookback_days: int, max_rps: int
         return proc.returncode, proc.stdout, proc.stderr
 
 
-def load_events_from_db(tickers: List[str], position: str, lookback_days: int) -> pd.DataFrame:
+def load_events_from_db(tickers: List[str], position: str, lookback_days: int, as_of_date: dt.date) -> pd.DataFrame:
     if not DB_PATH.exists():
         return pd.DataFrame()
 
-    today = dt.date.today()
+    today = as_of_date
     start = today - dt.timedelta(days=int(lookback_days) - 1)
 
     # SQLite has a default limit of 999 variables; 500 tickers is safe.
@@ -261,6 +271,12 @@ if sel == "Custom":
 else:
     position = sel
 
+as_of_date = st.sidebar.date_input(
+    "Search back from (end date)",
+    value=today_chicago(),
+    max_value=today_chicago(),
+)
+
 lookback_days = st.sidebar.slider("Look-back days", min_value=1, max_value=120, value=14)
 max_rps = st.sidebar.slider("Max requests/sec (keep ≤ 10)", min_value=1, max_value=10, value=8)
 
@@ -310,7 +326,7 @@ if run_clicked:
     else:
         try:
             with st.spinner("Scanning 8-K filings (this can take a few minutes depending on lookback and watchlist)…"):
-                code, out, err = run_scan(watchlist, position=position, lookback_days=lookback_days, max_rps=max_rps)
+                code, out, err = run_scan(watchlist, position=position, lookback_days=lookback_days, as_of_date=as_of_date, max_rps=max_rps)
 
             if code != 0:
                 st.error("Scan failed.")
@@ -333,7 +349,7 @@ if run_clicked:
 st.divider()
 
 st.subheader("Results")
-results = load_events_from_db(watchlist, position=position, lookback_days=lookback_days)
+results = load_events_from_db(watchlist, position=position, lookback_days=lookback_days, as_of_date=as_of_date)
 
 if results.empty:
     st.info("No matching executive appointment events found in the selected lookback window (or none scanned yet).")
@@ -354,7 +370,7 @@ else:
     with st.expander("Show evidence snippets (from filings)"):
         con = sqlite3.connect(DB_PATH)
         try:
-            today = dt.date.today()
+            today = as_of_date
             start = today - dt.timedelta(days=int(lookback_days) - 1)
             placeholders = ",".join(["?"] * len(watchlist))
             sql = f"""

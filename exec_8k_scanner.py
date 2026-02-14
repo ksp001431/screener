@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -389,9 +390,11 @@ def filings_from_daily_master_index_filtered(
     qtr = (day.month - 1) // 3 + 1
     yyyymmdd = day.strftime("%Y%m%d")
 
-    # Business-day patch: SEC often doesn't publish master index on Sat/Sun
-    if day.weekday() >= 5:  # Sat/Sun
+    # SEC daily master index files are often not published on weekends (and some holidays).
+    # Skipping weekends avoids unnecessary errors and reduces load.
+    if day.weekday() >= 5:  # 5=Sat, 6=Sun
         return []
+
     url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/master.{yyyymmdd}.idx"
     dir_url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/"
 
@@ -400,24 +403,25 @@ def filings_from_daily_master_index_filtered(
     except requests.HTTPError as e:
         status = getattr(e.response, "status_code", None)
 
-        # Missing/non-published index day
+        # Many non-business days will 404 (no index published)
         if status == 404:
             return []
 
-        # Some non-published days return 403 instead of 404
+        # Some non-published days have been observed to return 403 instead of 404.
+        # Differentiate "missing file" vs "blocked" by checking the quarter directory listing.
         if status == 403:
             try:
                 listing_html = client.get_text(dir_url)
                 if f"master.{yyyymmdd}.idx" not in listing_html:
                     return []
             except Exception:
-                # If we can't confirm it's missing, don't hide a potential real block
+                # If we can't confirm it's missing, don't silently ignore a potential real block.
                 pass
 
             raise RuntimeError(
                 f"SEC returned 403 for daily index: {url}. "
-                "If this file exists in the directory listing, you may be blocked "
-                "(check User-Agent / reduce max-rps / shared IP issues)."
+                "If this file exists in the quarter directory listing, you may be blocked "
+                "(check declared User-Agent / reduce max-rps / shared egress IP)."
             ) from e
 
         raise
@@ -1004,6 +1008,13 @@ def _parse_positive_int(s: str) -> int:
         raise argparse.ArgumentTypeError("Value must be >= 1")
     return v
 
+def _parse_iso_date(s: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        raise argparse.ArgumentTypeError("Date must be in YYYY-MM-DD format")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="Scan 8-K filings for executive appointments (Item 5.02) for a target position (e.g., CEO/CFO) and summarize compensation."
@@ -1019,7 +1030,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     scan.add_argument("--tickers", nargs="*", default=[], help="Ticker symbols (e.g., AAPL MSFT). For large lists, prefer --tickers-file.")
     scan.add_argument("--tickers-file", default="", help="Path to a file with tickers (one per line, or comma/space separated).")
     scan.add_argument("--position", required=True, help="Position to detect (e.g., CEO, CFO, or 'Chief Financial Officer').")
-    scan.add_argument("--lookback-days", type=_parse_positive_int, required=True, help="Look-back period in days (>= 1). Includes today.")
+    scan.add_argument("--lookback-days", type=_parse_positive_int, required=True, help="Look-back period in days (>= 1). Includes the as-of date.")
+    scan.add_argument("--as-of", type=_parse_iso_date, default=None, help="End date to look back from (YYYY-MM-DD). Defaults to today in America/Chicago.")
     scan.add_argument("--out-jsonl", default="events.jsonl")
     scan.add_argument("--out-csv", default="events.csv")
     scan.add_argument("--out-md", default="events.md")
@@ -1067,12 +1079,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("None of the provided tickers mapped to a CIK. Nothing to do.", file=sys.stderr)
         return 2
 
-    today = dt.date.today()
-    start = today - dt.timedelta(days=args.lookback_days - 1)
+    try:
+        today = dt.datetime.now(ZoneInfo("America/Chicago")).date()
+    except Exception:
+        today = dt.date.today()
+    as_of = args.as_of or today
+    if as_of > today:
+        print("--as-of cannot be in the future.", file=sys.stderr)
+        return 2
+
+    start = as_of - dt.timedelta(days=args.lookback_days - 1)
 
     all_events: List[ExecEvent] = []
 
-    for day in daterange_inclusive(start, today):
+    for day in daterange_inclusive(start, as_of):
         filings = filings_from_daily_master_index_filtered(
             client=client,
             day=day,
