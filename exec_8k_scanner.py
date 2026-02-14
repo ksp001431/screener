@@ -77,7 +77,54 @@ class SecEdgarClient:
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _throttle(self) -> None:
+  def filings_from_daily_master_index_filtered(
+    client: SecEdgarClient,
+    day: dt.date,
+    allowed_ciks: Set[str],
+    cik_to_ticker: Dict[str, str],
+    cik_to_title: Dict[str, str],
+) -> List[FilingRef]:
+
+    year = day.year
+    qtr = (day.month - 1) // 3 + 1
+    yyyymmdd = day.strftime("%Y%m%d")
+
+    # 1) Skip weekends: the SEC daily-index often has no master files on Sat/Sun
+    if day.weekday() >= 5:  # 5=Sat, 6=Sun
+        return []
+
+    url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/master.{yyyymmdd}.idx"
+    dir_url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/"
+
+    try:
+        txt = client.get_text(url, encoding="latin-1")
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+
+        # 2) Missing files: treat 404 as “no index today”
+        if status == 404:
+            return []
+
+        # Some missing days appear to return 403 instead of 404.
+        # Differentiate “missing file” vs “you are blocked” by checking the directory listing.
+        if status == 403:
+            try:
+                listing_html = client.get_text(dir_url)
+                if f"master.{yyyymmdd}.idx" not in listing_html:
+                    return []  # not published for this day (holiday or other non-index day)
+            except Exception:
+                # If we can't confirm by listing, don't silently ignore a real block
+                pass
+
+            raise RuntimeError(
+                f"SEC returned 403 for a daily index file that appears to exist ({url}). "
+                "This usually means your requests are being blocked: check declared User-Agent "
+                "and request rate per SEC fair access guidance."
+            ) from e
+
+        raise
+  
+  def _throttle(self) -> None:
         now = time.time()
         elapsed = now - self._last_request_ts
         if elapsed < self.min_interval:
