@@ -498,21 +498,60 @@ def parse_filing_index_html(client: SecEdgarClient, filing: FilingRef) -> List[F
         if len(cols) < 4:
             continue
         description = norm_ws(cols[1].get_text(" ", strip=True))
-        document = norm_ws(cols[2].get_text(" ", strip=True))
         doc_type = norm_ws(cols[3].get_text(" ", strip=True))
 
-        href_tag = cols[2].find("a")
-        if not href_tag or not href_tag.get("href"):
+        # The "Document" cell may contain both:
+        #   <a>somefile.htm</a>  <a>iXBRL</a>
+        # If we read the whole cell text, we can end up with
+        # "somefile.htm iXBRL" and later request ".../somefile.htm%20iXBRL" (404).
+        links = cols[2].find_all("a")
+        if not links:
             continue
-        href = href_tag["href"]
+
+        # Prefer a link whose visible text looks like a filename
+        doc_link = None
+        for a in links:
+            t = a.get_text(" ", strip=True)
+            if re.search(r"\.(?:htm|html|txt|xml)$", t, flags=re.IGNORECASE):
+                doc_link = a
+                break
+        if doc_link is None:
+            doc_link = links[0]
+
+        href = doc_link.get("href")
+        if not href:
+            continue
+        href = href.strip()
+
+        # Build absolute fetch URL
         if href.startswith("/"):
             url = "https://www.sec.gov" + href
+            href_clean = href
         elif href.startswith("http"):
             url = href
+            href_clean = href
         else:
             url = filing.base_dir_url() + href
+            href_clean = href
 
-        docs.append(FilingDocument(document, description, doc_type, url))
+        # Derive a clean filename/relative path from href
+        href_clean = href_clean.split("?", 1)[0].split("#", 1)[0]
+        base = filing.base_dir_url()
+        base_noscheme = base.replace("https://www.sec.gov", "")
+
+        if href_clean.startswith(base):
+            filename = href_clean[len(base):]
+        elif href_clean.startswith(base_noscheme):
+            filename = href_clean[len(base_noscheme):]
+        elif href_clean.startswith("http") or href_clean.startswith("/"):
+            filename = href_clean.rsplit("/", 1)[-1]
+        else:
+            filename = href_clean  # preserve relative subpaths if any
+
+        filename = filename.strip()
+
+        docs.append(FilingDocument(filename, description, doc_type, url))
+       
     return docs
 
 def pick_primary_doc(filing: FilingRef, docs: List[FilingDocument]) -> FilingRef:
@@ -529,7 +568,7 @@ def pick_primary_doc(filing: FilingRef, docs: List[FilingDocument]) -> FilingRef
 
     for d in docs:
         if d.filename.lower().endswith((".htm", ".html")):
-            return dataclasses.replace(filing, primary_doc=d.filename)
+            return dataclasses.replace(filing, primary_doc=d.filename.split()[0])
 
     # last resort: first doc
     if docs:
