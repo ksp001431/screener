@@ -388,14 +388,36 @@ def filings_from_daily_master_index_filtered(
     year = day.year
     qtr = (day.month - 1) // 3 + 1
     yyyymmdd = day.strftime("%Y%m%d")
+        if day.weekday() >= 5:  # Sat/Sun
+        return []
     url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/master.{yyyymmdd}.idx"
+    dir_url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/"
 
     try:
         txt = client.get_text(url, encoding="latin-1")
     except requests.HTTPError as e:
-        # Many non-business days will 404
-        if getattr(e.response, "status_code", None) == 404:
+        status = getattr(e.response, "status_code", None)
+
+        # Missing/non-published index day
+        if status == 404:
             return []
+
+        # Some non-published days return 403 instead of 404
+        if status == 403:
+            try:
+                listing_html = client.get_text(dir_url)
+                if f"master.{yyyymmdd}.idx" not in listing_html:
+                    return []
+            except Exception:
+                # If we can't confirm it's missing, don't hide a potential real block
+                pass
+
+            raise RuntimeError(
+                f"SEC returned 403 for daily index: {url}. "
+                "If this file exists in the directory listing, you may be blocked "
+                "(check User-Agent / reduce max-rps / shared IP issues)."
+            ) from e
+
         raise
 
     lines = txt.splitlines()
