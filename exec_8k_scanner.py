@@ -8,7 +8,7 @@ for a user-specified POSITION (e.g., CEO or CFO) and summarize compensation term
 Inputs:
   - A list of tickers (or a tickers file)
   - The position to detect (e.g., CEO, CFO, or a full title like "Chief Financial Officer")
-  - A look-back period in days
+  - A look-back period in months (up to 36)
 
 Outputs:
   - JSONL (structured)
@@ -24,6 +24,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import dataclasses
 import datetime as dt
@@ -34,15 +35,14 @@ import re
 import sqlite3
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
-
-
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 # -----------------------------
 # SEC client + rate limiting
 # -----------------------------
@@ -159,7 +159,18 @@ class ExtractedComp:
     base_salary: Optional[str] = None
     target_bonus: Optional[str] = None
     sign_on_bonus: Optional[str] = None
+
+    # Curated equity fields (prefer $ values)
+    equity_target_annual_values: List[str] = dataclasses.field(default_factory=list)
+    equity_target_annual_details: List[str] = dataclasses.field(default_factory=list)
+
+    equity_one_time_values: List[str] = dataclasses.field(default_factory=list)
+    equity_one_time_labels: List[str] = dataclasses.field(default_factory=list)
+    equity_one_time_details: List[str] = dataclasses.field(default_factory=list)
+
+    # Raw equity mentions (snippets) kept for auditability
     equity_awards: List[str] = dataclasses.field(default_factory=list)
+
     severance: List[str] = dataclasses.field(default_factory=list)
     other: List[str] = dataclasses.field(default_factory=list)
     evidence_snippets: List[str] = dataclasses.field(default_factory=list)
@@ -342,6 +353,17 @@ def daterange_inclusive(start: dt.date, end: dt.date) -> Iterable[dt.date]:
         d = d + dt.timedelta(days=1)
 
 
+
+def add_months(d: dt.date, months: int) -> dt.date:
+    """
+    Add (or subtract) whole months to a date, clamping the day to the end of month if needed.
+    Example: add_months(date(2026, 3, 31), -1) -> date(2026, 2, 28)
+    """
+    y = d.year + (d.month - 1 + months) // 12
+    m = (d.month - 1 + months) % 12 + 1
+    day = min(d.day, calendar.monthrange(y, m)[1])
+    return dt.date(y, m, day)
+
 # -----------------------------
 # Ticker/CIK mapping
 # -----------------------------
@@ -368,6 +390,111 @@ def load_ticker_info(client: SecEdgarClient) -> Dict[str, TickerInfo]:
             out[t.upper()] = TickerInfo(ticker=t.upper(), cik=str(cik).zfill(10), title=title)
     return out
 
+
+
+
+# -----------------------------
+# Ingestion via SEC Submissions API (fast for small watchlists)
+# -----------------------------
+
+def _filings_from_submissions_block(
+    block: Dict[str, Any],
+    cik10: str,
+    ticker: Optional[str],
+    company_name: Optional[str],
+    start: dt.date,
+    end: dt.date,
+) -> List[FilingRef]:
+    filings = (block.get("filings") or {})
+    recent = (filings.get("recent") or {})
+    forms = recent.get("form") or []
+    accession_numbers = recent.get("accessionNumber") or []
+    filing_dates = recent.get("filingDate") or []
+    primary_docs = recent.get("primaryDocument") or []
+
+    out: List[FilingRef] = []
+    for form, acc, fdate, pdoc in zip(forms, accession_numbers, filing_dates, primary_docs):
+        if form not in ("8-K", "8-K/A"):
+            continue
+        d_str = parse_date(str(fdate)) or str(fdate)
+        try:
+            d_obj = dt.date.fromisoformat(d_str)
+        except Exception:
+            continue
+        if d_obj < start or d_obj > end:
+            continue
+
+        pd = (str(pdoc) if pdoc is not None else "").strip().split()[0]
+        out.append(
+            FilingRef(
+                cik=cik10,
+                accession=str(acc),
+                filing_date=d_str,
+                form=str(form),
+                primary_doc=pd,  # may be blank; we'll still validate via index.html
+                company_name=company_name,
+                ticker=ticker,
+            )
+        )
+    return out
+
+
+def filings_from_submissions_range(
+    client: SecEdgarClient,
+    cik10: str,
+    start: dt.date,
+    end: dt.date,
+    ticker: Optional[str] = None,
+    company_title_fallback: Optional[str] = None,
+) -> List[FilingRef]:
+    """
+    Pull 8-K / 8-K/A filings for a single company over [start, end] (inclusive)
+    using the SEC Submissions API (data.sec.gov). Handles pagination via filings.files.
+
+    This is typically far more efficient than scanning daily master indexes when the watchlist is small.
+    """
+    main_url = f"https://data.sec.gov/submissions/CIK{cik10}.json"
+    data = client.get_json(main_url)
+
+    company_name = (data.get("name") or company_title_fallback or "").strip() or company_title_fallback
+
+    out: List[FilingRef] = []
+    out.extend(_filings_from_submissions_block(data, cik10, ticker, company_name, start, end))
+
+    files = (((data.get("filings") or {}).get("files")) or [])
+    for f in files:
+        name = (f.get("name") or "").strip()
+        if not name:
+            continue
+
+        # Only fetch file segments that overlap our date range
+        try:
+            frm = dt.date.fromisoformat(str(f.get("filingFrom")))
+            to = dt.date.fromisoformat(str(f.get("filingTo")))
+        except Exception:
+            frm = None
+            to = None
+
+        if frm and to:
+            if to < start or frm > end:
+                continue
+
+        seg_url = "https://data.sec.gov/submissions/" + name
+        try:
+            seg = client.get_json(seg_url)
+        except requests.HTTPError:
+            continue
+        out.extend(_filings_from_submissions_block(seg, cik10, ticker, company_name, start, end))
+
+    # Dedupe by accession
+    dedup: Dict[str, FilingRef] = {}
+    for fr in out:
+        dedup[fr.accession] = fr
+
+    # Sort newest-first
+    res = list(dedup.values())
+    res.sort(key=lambda x: x.filing_date, reverse=True)
+    return res
 
 # -----------------------------
 # Ingestion via daily master index (scales to big watchlists)
@@ -635,9 +762,25 @@ def pick_primary_doc(filing: FilingRef, docs: List[FilingDocument]) -> FilingRef
     return filing
 
 def html_to_text(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
+    """
+    Convert (X)HTML to plain text.
+
+    Some SEC documents (notably iXBRL / XHTML) start with an XML prolog (<?xml ...?>).
+    BeautifulSoup will warn if you parse XML as HTML; this function picks an XML parser
+    for those cases and also suppresses the warning as a safety net.
+    """
+    s = html.lstrip()
+    # iXBRL is typically XHTML (XML prolog + <html xmlns=...>), so use an XML parser there.
+    parser = "lxml-xml" if s.startswith("<?xml") else "lxml"
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(html, parser)
+
+    # For HTML, remove script/style noise. For XML/XHTML, these tags may still exist and it's safe to remove.
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
+
     return norm_ws(soup.get_text(" ", strip=True))
 
 def fetch_text_for_doc(client: SecEdgarClient, doc_url: str) -> str:
@@ -845,12 +988,122 @@ COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("equity_award", re.compile(r"\b(stock option|options?)\b[^.:\n]{0,280}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares)", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(restricted stock units|RSUs|stock options?|option award)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(long-?term incentive|LTI|equity incentive|target award value|grant date value)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(annual|target)\b[^.:\n]{0,240}?\b(long-?term incentive|LTI|equity)\b[^.:\n]{0,240}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(inducement|make-?whole|make whole|sign(?:ing)?|new hire|initial|one-?time)\b[^.:\n]{0,240}?\b(award|grant|RSUs?|restricted stock|equity|stock options?)\b[^.:\n]{0,240}?({DOLLAR_RE})", re.IGNORECASE)),
 
     # Severance / CIC
     ("severance", re.compile(r"\bseverance\b[^.:\n]{0,320}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE)),
     ("severance", re.compile(r"\bchange in control\b[^.:\n]{0,340}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE)),
     ("severance", re.compile(r"\bseverance\b[^.:\n]{0,340}?\b(\d(?:\.\d)?)\s?x\b", re.IGNORECASE)),
 ]
+
+def _dedupe(seq: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+MONEY_FIND_RE = re.compile(DOLLAR_RE)
+
+EQUITY_CONTEXT_KWS = (
+    "equity",
+    "long-term incentive",
+    "long term incentive",
+    "lti",
+    "restricted stock",
+    "rsu",
+    "stock option",
+    "options",
+    "performance share",
+    "psu",
+    "grant",
+    "award",
+)
+
+ONE_TIME_KWS = (
+    "one-time",
+    "one time",
+    "signing",
+    "sign-on",
+    "sign on",
+    "inducement",
+    "make-whole",
+    "make whole",
+    "new hire",
+    "initial",
+    "commencement",
+    "makewhole",
+    "make whole",
+    "special",
+)
+
+ANNUAL_TARGET_KWS = (
+    "annual",
+    "target",
+    "target award value",
+    "lti target",
+    "long-term incentive target",
+    "long term incentive target",
+    "annual long-term incentive",
+    "annual equity",
+    "equity incentive target",
+)
+
+def _extract_money_strings(s: str) -> List[str]:
+    return [money_norm(x) for x in MONEY_FIND_RE.findall(s or "")]
+
+def _equity_labels(s_low: str) -> List[str]:
+    labels: List[str] = []
+    if "inducement" in s_low:
+        labels.append("inducement")
+    if "make-whole" in s_low or "make whole" in s_low:
+        labels.append("make-whole")
+    if "signing" in s_low or "sign-on" in s_low or "sign on" in s_low:
+        labels.append("signing")
+    if "new hire" in s_low or "initial" in s_low or "commencement" in s_low:
+        labels.append("new-hire")
+    if "one-time" in s_low or "one time" in s_low or "special" in s_low:
+        labels.append("one-time")
+    return _dedupe(labels)
+
+def _classify_equity_snippet(s: str) -> str:
+    s_low = (s or "").lower()
+    if not any(k in s_low for k in EQUITY_CONTEXT_KWS):
+        return "other"
+
+    one_time_score = 0
+    annual_score = 0
+
+    if any(k in s_low for k in ONE_TIME_KWS):
+        one_time_score += 3
+    if "grant date value" in s_low:
+        one_time_score += 2
+
+    if any(k in s_low for k in ANNUAL_TARGET_KWS):
+        annual_score += 3
+    # light signals
+    if "target" in s_low:
+        annual_score += 1
+    if re.search(r"\b20\d{2}\b", s_low):
+        annual_score += 1
+
+    if one_time_score > annual_score and one_time_score >= 2:
+        return "one_time"
+    if annual_score >= 2:
+        return "annual_target"
+
+    # Tie-breakers
+    if any(k in s_low for k in ("one-time", "one time", "inducement", "make-whole", "make whole", "signing", "new hire", "initial")):
+        return "one_time"
+    if "annual" in s_low or "target" in s_low:
+        return "annual_target"
+
+    return "other"
+
 
 def extract_compensation(text: str) -> ExtractedComp:
     comp = ExtractedComp()
@@ -867,9 +1120,24 @@ def extract_compensation(text: str) -> ExtractedComp:
             elif field == "sign_on_bonus" and comp.sign_on_bonus is None:
                 comp.sign_on_bonus = money_norm(m.group(2))
             elif field == "equity_award":
-                comp.equity_awards.append(snippet[:320])
+                comp.equity_awards.append(snippet[:360])
             elif field == "severance":
-                comp.severance.append(snippet[:320])
+                comp.severance.append(snippet[:360])
+
+    # Curate equity into annual/target vs one-time buckets (prefer $ values)
+    for snip in comp.equity_awards:
+        monies = _extract_money_strings(snip)
+        if not monies:
+            continue
+
+        cat = _classify_equity_snippet(snip)
+        if cat == "annual_target":
+            comp.equity_target_annual_details.append(snip[:360])
+            comp.equity_target_annual_values.extend(monies)
+        elif cat == "one_time":
+            comp.equity_one_time_details.append(snip[:360])
+            comp.equity_one_time_values.extend(monies)
+            comp.equity_one_time_labels.extend(_equity_labels(snip.lower()))
 
     for kw in (
         "relocation",
@@ -886,37 +1154,43 @@ def extract_compensation(text: str) -> ExtractedComp:
         if re.search(rf"\b{re.escape(kw)}\b", text, re.IGNORECASE):
             comp.other.append(kw)
 
-    def dedupe(seq: List[str]) -> List[str]:
-        seen = set()
-        out = []
-        for x in seq:
-            if x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
+    # Dedup lists
+    comp.equity_awards = _dedupe(comp.equity_awards)
+    comp.equity_target_annual_values = _dedupe(comp.equity_target_annual_values)
+    comp.equity_target_annual_details = _dedupe(comp.equity_target_annual_details)
+    comp.equity_one_time_values = _dedupe(comp.equity_one_time_values)
+    comp.equity_one_time_labels = _dedupe(comp.equity_one_time_labels)
+    comp.equity_one_time_details = _dedupe(comp.equity_one_time_details)
 
-    comp.equity_awards = dedupe(comp.equity_awards)
-    comp.severance = dedupe(comp.severance)
-    comp.other = dedupe(comp.other)
-    comp.evidence_snippets = dedupe(comp.evidence_snippets)
+    comp.severance = _dedupe(comp.severance)
+    comp.other = _dedupe(comp.other)
+    comp.evidence_snippets = _dedupe(comp.evidence_snippets)
     return comp
 
 def compensation_brief(comp: ExtractedComp) -> str:
-    bits = []
+    bits: List[str] = []
     if comp.base_salary:
         bits.append(f"Base salary {comp.base_salary}")
     if comp.target_bonus:
         bits.append(f"Target bonus {comp.target_bonus}")
     if comp.sign_on_bonus:
         bits.append(f"Sign-on {comp.sign_on_bonus}")
-    if comp.equity_awards:
+
+    if comp.equity_target_annual_values:
+        bits.append("Equity target/annual " + ", ".join(comp.equity_target_annual_values))
+    if comp.equity_one_time_values:
+        lab = f" ({', '.join(comp.equity_one_time_labels)})" if comp.equity_one_time_labels else ""
+        bits.append("One-time equity " + ", ".join(comp.equity_one_time_values) + lab)
+
+    # Fallback if we saw equity snippets but couldn't extract $ values
+    if not comp.equity_target_annual_values and not comp.equity_one_time_values and comp.equity_awards:
         bits.append(f"Equity mentions {len(comp.equity_awards)}")
+
     if comp.severance:
         bits.append(f"Severance/CIC mentions {len(comp.severance)}")
     if comp.other:
         bits.append("Other: " + ", ".join(comp.other))
     return "; ".join(bits) if bits else "No comp terms detected in scanned docs/exhibits."
-
 
 # -----------------------------
 # Summarization
@@ -953,8 +1227,9 @@ def process_filing(
     filing: FilingRef,
     position_query: str,
     max_exhibits: int = 8,
+    force: bool = False,
 ) -> List[ExecEvent]:
-    if store.already_processed(filing.accession, position_query):
+    if (not force) and store.already_processed(filing.accession, position_query):
         return []
 
     docs = parse_filing_index_html(client, filing)
@@ -1058,10 +1333,13 @@ def write_outputs(
             "base_salary",
             "target_bonus",
             "sign_on_bonus",
-            "equity_mentions_count",
+            "equity_target_annual_values",
+            "equity_one_time_values",
+            "equity_one_time_labels",
             "severance_mentions_count",
             "other_keywords",
             "compensation_brief",
+            "source_8k_url",
             "primary_doc_url",
         ]
         exists = out_csv.exists()
@@ -1086,10 +1364,13 @@ def write_outputs(
                         "base_salary": comp.base_salary or "",
                         "target_bonus": comp.target_bonus or "",
                         "sign_on_bonus": comp.sign_on_bonus or "",
-                        "equity_mentions_count": str(len(comp.equity_awards)),
+                        "equity_target_annual_values": "; ".join(comp.equity_target_annual_values),
+                        "equity_one_time_values": "; ".join(comp.equity_one_time_values),
+                        "equity_one_time_labels": ", ".join(comp.equity_one_time_labels),
                         "severance_mentions_count": str(len(comp.severance)),
                         "other_keywords": ", ".join(comp.other),
                         "compensation_brief": compensation_brief(comp),
+                        "source_8k_url": e.filing.index_html_url(),
                         "primary_doc_url": e.filing.primary_url(),
                     }
                 )
@@ -1137,15 +1418,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    scan = sub.add_parser("scan", help="Scan a watchlist of tickers over a look-back period using daily master indexes (scales to large lists).")
+    scan = sub.add_parser("scan", help="Scan a watchlist of tickers for executive appointment 8-Ks (Item 5.02) over a look-back window (months).")
     scan.add_argument("--tickers", nargs="*", default=[], help="Ticker symbols (e.g., AAPL MSFT). For large lists, prefer --tickers-file.")
     scan.add_argument("--tickers-file", default="", help="Path to a file with tickers (one per line, or comma/space separated).")
     scan.add_argument("--position", required=True, help="Position to detect (e.g., CEO, CFO, or 'Chief Financial Officer').")
-    scan.add_argument("--lookback-days", type=_parse_positive_int, required=True, help="Look-back period in days (>= 1). Includes the as-of date.")
+    scan.add_argument("--lookback-months", type=_parse_positive_int, required=True, help="Look-back period in months (1-36). Includes the as-of date.")
     scan.add_argument("--as-of", type=_parse_iso_date, default=None, help="End date to look back from (YYYY-MM-DD). Defaults to today in America/Chicago.")
+    scan.add_argument("--mode", choices=["submissions", "daily-index"], default="submissions",
+                      help="Ingestion mode. 'submissions' is efficient for small watchlists; 'daily-index' scans the daily master index across dates.")
+    scan.add_argument("--force", action="store_true", help="Re-scan filings even if already processed (refresh extraction).")
     scan.add_argument("--out-jsonl", default="events.jsonl")
     scan.add_argument("--out-csv", default="events.csv")
     scan.add_argument("--out-md", default="events.md")
+
+
 
     args = p.parse_args(argv)
 
@@ -1199,29 +1485,85 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("--as-of cannot be in the future.", file=sys.stderr)
         return 2
 
-    start = as_of - dt.timedelta(days=args.lookback_days - 1)
+    if args.lookback_months > 36:
+        print("--lookback-months cannot exceed 36.", file=sys.stderr)
+        return 2
+
+    start = add_months(as_of, -int(args.lookback_months))
 
     all_events: List[ExecEvent] = []
 
-    for day in daterange_inclusive(start, as_of):
-        filings = filings_from_daily_master_index_filtered(
-            client=client,
-            day=day,
-            allowed_ciks=allowed_ciks,
-            cik_to_ticker=cik_to_ticker,
-            cik_to_title=cik_to_title,
-        )
-        for filing in filings:
+    if args.mode == "daily-index":
+        # Daily master index mode (scales better for huge watchlists, but is slower for long lookbacks)
+        for day in daterange_inclusive(start, as_of):
+            filings = filings_from_daily_master_index_filtered(
+                client=client,
+                day=day,
+                allowed_ciks=allowed_ciks,
+                cik_to_ticker=cik_to_ticker,
+                cik_to_title=cik_to_title,
+            )
+            for filing in filings:
+                try:
+                    events = process_filing(
+                        client=client,
+                        store=store,
+                        filing=filing,
+                        position_query=args.position,
+                        force=bool(args.force),
+                    )
+                    all_events.extend(events)
+                except requests.HTTPError as e:
+                    # Skip problematic filings but keep scanning
+                    print(f"HTTP error processing {filing.accession}: {e}", file=sys.stderr)
+                except Exception as e:
+                    print(f"Error processing {filing.accession}: {e}", file=sys.stderr)
+    else:
+        # Submissions API mode (recommended for small watchlists; fast even up to 36 months)
+        filings_to_scan: List[FilingRef] = []
+        for t in tickers:
+            info = ticker_info.get(t)
+            if not info:
+                continue
+            try:
+                filings_to_scan.extend(
+                    filings_from_submissions_range(
+                        client=client,
+                        cik10=info.cik,
+                        start=start,
+                        end=as_of,
+                        ticker=info.ticker,
+                        company_title_fallback=info.title,
+                    )
+                )
+            except requests.HTTPError as e:
+                print(f"HTTP error fetching submissions for {t}: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"Error fetching submissions for {t}: {e}", file=sys.stderr)
+
+        # Dedupe by accession
+        seen_acc: Set[str] = set()
+        unique_filings: List[FilingRef] = []
+        for fr in filings_to_scan:
+            if fr.accession in seen_acc:
+                continue
+            seen_acc.add(fr.accession)
+            unique_filings.append(fr)
+
+        # Sort newest-first
+        unique_filings.sort(key=lambda x: x.filing_date, reverse=True)
+
+        for filing in unique_filings:
             try:
                 events = process_filing(
                     client=client,
                     store=store,
                     filing=filing,
                     position_query=args.position,
+                    force=bool(args.force),
                 )
                 all_events.extend(events)
             except requests.HTTPError as e:
-                # Skip problematic filings but keep scanning
                 print(f"HTTP error processing {filing.accession}: {e}", file=sys.stderr)
             except Exception as e:
                 print(f"Error processing {filing.accession}: {e}", file=sys.stderr)

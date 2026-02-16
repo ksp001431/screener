@@ -1,3 +1,4 @@
+import calendar
 import datetime as dt
 from zoneinfo import ZoneInfo
 import io
@@ -17,7 +18,7 @@ import streamlit as st
 # ----------
 # App config
 # ----------
-st.set_page_config(page_title="8-K Executive Appointment Scanner", layout="wide")
+st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide")
 
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
@@ -28,13 +29,20 @@ SCANNER = Path("exec_8k_scanner.py")
 # ----------
 # Helpers
 # ----------
-
-
 def today_chicago() -> dt.date:
     try:
         return dt.datetime.now(ZoneInfo("America/Chicago")).date()
     except Exception:
         return dt.date.today()
+
+
+def add_months(d: dt.date, months: int) -> dt.date:
+    """Add (or subtract) months to a date, clamping the day to end-of-month as needed."""
+    y = d.year + (d.month - 1 + months) // 12
+    m = (d.month - 1 + months) % 12 + 1
+    day = min(d.day, calendar.monthrange(y, m)[1])
+    return dt.date(y, m, day)
+
 
 def parse_tickers(text: str) -> List[str]:
     """Parse tickers from a free-form blob (newlines/commas/spaces; supports # comments)."""
@@ -67,7 +75,15 @@ def get_user_agent() -> str:
     return (ua or os.environ.get("SEC_USER_AGENT", "")).strip()
 
 
-def run_scan(tickers: List[str], position: str, lookback_days: int, as_of_date: dt.date, max_rps: int) -> Tuple[int, str, str]:
+def run_scan(
+    tickers: List[str],
+    position: str,
+    lookback_months: int,
+    as_of_date: dt.date,
+    max_rps: int,
+    force: bool,
+    mode: str = "submissions",
+) -> Tuple[int, str, str]:
     """Run the scanner as a subprocess. Returns (exit_code, stdout, stderr)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +92,7 @@ def run_scan(tickers: List[str], position: str, lookback_days: int, as_of_date: 
         tickers_file = td_path / "tickers.txt"
         tickers_file.write_text("\n".join(tickers) + "\n", encoding="utf-8")
 
-        # Write outputs to a temp directory (we read results from the SQLite DB).
+        # Outputs are written, but the app reads results from SQLite.
         out_csv = td_path / "events.csv"
         out_jsonl = td_path / "events.jsonl"
         out_md = td_path / "events.md"
@@ -99,10 +115,12 @@ def run_scan(tickers: List[str], position: str, lookback_days: int, as_of_date: 
             str(tickers_file),
             "--position",
             position,
-            "--lookback-days",
-            str(int(lookback_days)),
+            "--lookback-months",
+            str(int(lookback_months)),
             "--as-of",
             as_of_date.isoformat(),
+            "--mode",
+            mode,
             "--out-csv",
             str(out_csv),
             "--out-jsonl",
@@ -110,19 +128,20 @@ def run_scan(tickers: List[str], position: str, lookback_days: int, as_of_date: 
             "--out-md",
             str(out_md),
         ]
+        if force:
+            cmd.append("--force")
 
         proc = subprocess.run(cmd, capture_output=True, text=True)
         return proc.returncode, proc.stdout, proc.stderr
 
 
-def load_events_from_db(tickers: List[str], position: str, lookback_days: int, as_of_date: dt.date) -> pd.DataFrame:
+def load_events_from_db(tickers: List[str], position: str, lookback_months: int, as_of_date: dt.date) -> pd.DataFrame:
     if not DB_PATH.exists():
         return pd.DataFrame()
 
-    today = as_of_date
-    start = today - dt.timedelta(days=int(lookback_days) - 1)
+    end = as_of_date
+    start = add_months(end, -int(lookback_months))
 
-    # SQLite has a default limit of 999 variables; 500 tickers is safe.
     placeholders = ",".join(["?"] * len(tickers)) if tickers else ""
 
     sql = f"""
@@ -144,7 +163,7 @@ def load_events_from_db(tickers: List[str], position: str, lookback_days: int, a
         ORDER BY filing_date DESC, confidence DESC
     """
 
-    params: List[str] = [position, start.isoformat(), today.isoformat()]
+    params: List[str] = [position, start.isoformat(), end.isoformat()]
     if tickers:
         params.extend(tickers)
 
@@ -161,32 +180,38 @@ def load_events_from_db(tickers: List[str], position: str, lookback_days: int, a
 
     df = pd.DataFrame(rows, columns=cols)
 
-    # Expand compensation details from raw_json
+    # Expand curated compensation fields from raw_json
     def comp_fields(raw: str) -> Dict[str, str]:
         try:
             obj = json.loads(raw)
         except Exception:
             return {}
+
         comp = (obj.get("compensation") or {})
         filing = (obj.get("filing") or {})
-        equity = comp.get("equity_awards") or []
-        sever = comp.get("severance") or []
         other = comp.get("other") or []
 
-        # Build primary doc URL from filing fields (dataclasses.asdict doesn't include computed properties)
-        primary_url = ""
+        # Build URLs from filing fields (dataclasses.asdict doesn't include computed properties)
+        source_8k_url = ""
+        primary_doc_url = ""
         try:
             cik = str(filing.get("cik") or "")
             accession = str(filing.get("accession") or "")
             primary_doc = str(filing.get("primary_doc") or "")
-            if cik.isdigit() and accession and primary_doc:
+            if cik.isdigit() and accession:
                 cik_int = int(cik)
                 acc_no = accession.replace("-", "")
-                primary_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
+                source_8k_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{accession}-index.html"
+                if primary_doc:
+                    primary_doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
         except Exception:
-            primary_url = ""
+            pass
 
-        # A short summary suitable for spreadsheet / UI
+        eq_target = comp.get("equity_target_annual_values") or []
+        eq_one_time = comp.get("equity_one_time_values") or []
+        eq_labels = comp.get("equity_one_time_labels") or []
+
+        # A short human-readable summary
         parts = []
         if comp.get("base_salary"):
             parts.append(f"Base {comp['base_salary']}")
@@ -194,40 +219,35 @@ def load_events_from_db(tickers: List[str], position: str, lookback_days: int, a
             parts.append(f"Bonus {comp['target_bonus']}")
         if comp.get("sign_on_bonus"):
             parts.append(f"Sign-on {comp['sign_on_bonus']}")
-        if equity:
-            parts.append(f"Equity mentions {len(equity)}")
-        if sever:
-            parts.append(f"Severance/CIC mentions {len(sever)}")
-        if other:
-            parts.append("Other: " + ", ".join(other))
+        if eq_target:
+            parts.append("Equity target/annual " + ", ".join(eq_target))
+        if eq_one_time:
+            lab = f" ({', '.join(eq_labels)})" if eq_labels else ""
+            parts.append("One-time equity " + ", ".join(eq_one_time) + lab)
 
         return {
             "base_salary": comp.get("base_salary", ""),
             "target_bonus": comp.get("target_bonus", ""),
             "sign_on_bonus": comp.get("sign_on_bonus", ""),
-            "equity_mentions_count": str(len(equity)),
-            "severance_mentions_count": str(len(sever)),
+            "equity_target_annual_values": "; ".join(eq_target),
+            "equity_one_time_values": "; ".join(eq_one_time),
+            "equity_one_time_labels": ", ".join(eq_labels),
             "other_keywords": ", ".join(other),
-            "compensation_details": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
-            "primary_doc_url": primary_url,
+            "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
+            "source_8k_url": source_8k_url,
+            "primary_doc_url": primary_doc_url,
         }
 
     expanded = df["raw_json"].apply(comp_fields).apply(pd.Series)
     df = pd.concat([df.drop(columns=["raw_json"]), expanded], axis=1)
 
-    # Rename to match your requested output labels
-    df = df.rename(
-        columns={
-            "person": "new_executive",
-            "matched_title": "position",
-        }
-    )
+    df = df.rename(columns={"person": "new_executive", "matched_title": "position"})
 
-    # Order columns
     ordered = [
         "ticker",
         "company_name",
         "filing_date",
+        "source_8k_url",
         "new_executive",
         "position",
         "effective_date",
@@ -235,10 +255,11 @@ def load_events_from_db(tickers: List[str], position: str, lookback_days: int, a
         "base_salary",
         "target_bonus",
         "sign_on_bonus",
-        "equity_mentions_count",
-        "severance_mentions_count",
+        "equity_target_annual_values",
+        "equity_one_time_values",
+        "equity_one_time_labels",
         "other_keywords",
-        "compensation_details",
+        "compensation_summary",
         "primary_doc_url",
         "confidence",
     ]
@@ -249,11 +270,10 @@ def load_events_from_db(tickers: List[str], position: str, lookback_days: int, a
 # ----------
 # UI
 # ----------
-
-st.title("8-K Executive Appointment Scanner")
+st.title("8-K Executive Appointment Screener")
 st.caption(
-    "Scans SEC Form 8-K / 8-K/A filings (Item 5.02) for executive appointments for a chosen position "
-    "and summarizes compensation terms (heuristic). Always review the filing for full context."
+    "Scans SEC Form 8-K / 8-K/A filings (Item 5.02) for executive appointments/promotions for a chosen position "
+    "and summarizes compensation terms (heuristic). Always review the underlying filing for full context."
 )
 
 ua = get_user_agent()
@@ -264,8 +284,9 @@ if not ua or "@" not in ua:
     )
 
 st.sidebar.header("Scan settings")
+
 common_positions = ["CEO", "CFO", "COO", "CTO", "CIO", "CMO", "CHRO", "CAO", "CLO", "Custom"]
-sel = st.sidebar.selectbox("Position", common_positions, index=0)
+sel = st.sidebar.selectbox("Position", common_positions, index=1)
 if sel == "Custom":
     position = st.sidebar.text_input("Custom position title", value="Chief Risk Officer")
 else:
@@ -277,8 +298,19 @@ as_of_date = st.sidebar.date_input(
     max_value=today_chicago(),
 )
 
-lookback_days = st.sidebar.slider("Look-back days", min_value=1, max_value=120, value=14)
-max_rps = st.sidebar.slider("Max requests/sec (keep ≤ 10)", min_value=1, max_value=10, value=8)
+lookback_months = st.sidebar.slider("Look-back months", min_value=1, max_value=36, value=6)
+max_rps = st.sidebar.slider("Max requests/sec (keep ≤ 10)", min_value=1, max_value=10, value=6)
+
+with st.sidebar.expander("Advanced"):
+    mode = st.selectbox("Ingestion mode", ["submissions", "daily-index"], index=0,
+                        help="'submissions' is best for small watchlists; 'daily-index' scans the market-wide daily index across dates.")
+    force = st.checkbox("Refresh existing filings (force re-scan)", value=False,
+                        help="Turn on once after updating the extractor to refresh older saved results in the SQLite DB.")
+
+st.sidebar.caption(
+    f"Window: {add_months(as_of_date, -int(lookback_months)).isoformat()} → {as_of_date.isoformat()}  "
+    f"({lookback_months} month{'s' if lookback_months != 1 else ''})"
+)
 
 st.subheader("Watchlist")
 colA, colB = st.columns([1, 1])
@@ -288,11 +320,9 @@ with colA:
 with colB:
     pasted = st.text_area(
         "Or paste tickers (comma/space/newline separated)",
-        placeholder="AAPL\nMSFT\nNVDA\n...",
+        placeholder="MPC\nAAPL\nMSFT\n...",
         height=140,
     )
-
-repo_watchlist_path = st.text_input("Optional: watchlist file path in repo", value="")
 
 tickers: List[str] = []
 if uploaded is not None:
@@ -302,13 +332,6 @@ if uploaded is not None:
         st.error("Could not read uploaded file as UTF-8 text.")
 if pasted.strip():
     tickers.extend(parse_tickers(pasted))
-
-if repo_watchlist_path.strip():
-    pth = Path(repo_watchlist_path.strip())
-    if pth.exists() and pth.is_file():
-        tickers.extend(parse_tickers(pth.read_text(encoding="utf-8", errors="replace")))
-    else:
-        st.info("Repo watchlist path not found (ignored).")
 
 # de-dupe while preserving order
 seen = set()
@@ -325,8 +348,16 @@ if run_clicked:
         st.warning("A scan is already running. Please try again in a few minutes.")
     else:
         try:
-            with st.spinner("Scanning 8-K filings (this can take a few minutes depending on lookback and watchlist)…"):
-                code, out, err = run_scan(watchlist, position=position, lookback_days=lookback_days, as_of_date=as_of_date, max_rps=max_rps)
+            with st.spinner("Scanning 8-K filings…"):
+                code, out, err = run_scan(
+                    watchlist,
+                    position=position,
+                    lookback_months=lookback_months,
+                    as_of_date=as_of_date,
+                    max_rps=max_rps,
+                    force=force,
+                    mode=mode,
+                )
 
             if code != 0:
                 st.error("Scan failed.")
@@ -349,12 +380,20 @@ if run_clicked:
 st.divider()
 
 st.subheader("Results")
-results = load_events_from_db(watchlist, position=position, lookback_days=lookback_days, as_of_date=as_of_date)
+results = load_events_from_db(watchlist, position=position, lookback_months=lookback_months, as_of_date=as_of_date)
 
 if results.empty:
-    st.info("No matching executive appointment events found in the selected lookback window (or none scanned yet).")
+    st.info("No matching executive appointment events found in the selected window (or none scanned yet).")
 else:
-    st.dataframe(results, use_container_width=True)
+    st.dataframe(
+        results,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "source_8k_url": st.column_config.LinkColumn("8‑K", display_text="Open 8‑K"),
+            "primary_doc_url": st.column_config.LinkColumn("Primary doc", display_text="Open"),
+        },
+    )
 
     # Download CSV
     csv_buf = io.StringIO()
@@ -365,55 +404,6 @@ else:
         file_name="events.csv",
         mime="text/csv",
     )
-
-    # Show detailed evidence snippets from raw JSON (optional)
-    with st.expander("Show evidence snippets (from filings)"):
-        con = sqlite3.connect(DB_PATH)
-        try:
-            today = as_of_date
-            start = today - dt.timedelta(days=int(lookback_days) - 1)
-            placeholders = ",".join(["?"] * len(watchlist))
-            sql = f"""
-                SELECT ticker, company_name, filing_date, person, matched_title, raw_json
-                FROM exec_events
-                WHERE position_query = ?
-                  AND filing_date >= ?
-                  AND filing_date <= ?
-                  AND ticker IN ({placeholders})
-                ORDER BY filing_date DESC
-            """
-            params = [position, start.isoformat(), today.isoformat()] + watchlist
-            rows = con.execute(sql, params).fetchall()
-        finally:
-            con.close()
-
-        for (ticker, company, fdate, person, title, raw) in rows[:25]:
-            try:
-                obj = json.loads(raw)
-                snippets = ((obj.get("compensation") or {}).get("evidence_snippets") or [])
-                filing = (obj.get("filing") or {})
-                # Rebuild primary document URL from filing fields.
-                primary_url = ""
-                cik = str(filing.get("cik") or "")
-                accession = str(filing.get("accession") or "")
-                primary_doc = str(filing.get("primary_doc") or "")
-                if cik.isdigit() and accession and primary_doc:
-                    cik_int = int(cik)
-                    acc_no = accession.replace("-", "")
-                    primary_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
-            except Exception:
-                snippets = []
-                primary_url = ""
-
-            st.markdown(f"**{ticker} — {company}**  \nFiled: {fdate}  \nExecutive: {person}  \nPosition: {title}")
-            if primary_url:
-                st.write(primary_url)
-            if snippets:
-                for sn in snippets[:6]:
-                    st.write("- " + sn)
-            else:
-                st.write("(No evidence snippets captured.)")
-            st.write("—")
 
 st.caption(
     "Note: This app throttles requests, but avoid running multiple instances in parallel to stay within SEC fair-access limits."
