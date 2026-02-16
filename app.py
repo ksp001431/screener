@@ -135,7 +135,128 @@ def run_scan(
         return proc.returncode, proc.stdout, proc.stderr
 
 
+# ----------
+# Results loader
+# ----------
+
+def _to_int(x):
+    try:
+        if x is None or x == "":
+            return None
+        return int(float(x))
+    except Exception:
+        return None
+
+def _to_float(x):
+    try:
+        if x is None or x == "":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _comp_fields_from_raw_json(raw: str) -> Dict[str, object]:
+    """Expand curated compensation + source URLs from the stored raw_json."""
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+
+    comp = (obj.get("compensation") or {})
+    filing = (obj.get("filing") or {})
+    other = comp.get("other") or []
+
+    # Build URLs from filing fields (dataclasses.asdict doesn't include computed properties)
+    source_8k_url = ""
+    primary_doc_url = ""
+    try:
+        cik = str(filing.get("cik") or "")
+        accession = str(filing.get("accession") or "")
+        primary_doc = str(filing.get("primary_doc") or "")
+        if cik.isdigit() and accession:
+            cik_int = int(cik)
+            acc_no = accession.replace("-", "")
+            source_8k_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{accession}-index.html"
+            if primary_doc:
+                primary_doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
+    except Exception:
+        pass
+
+    # Numeric core comp fields (USD assumed)
+    base_salary_usd = _to_int(comp.get("base_salary_usd"))
+    target_bonus_pct = _to_float(comp.get("target_bonus_pct"))
+    target_bonus_usd = _to_int(comp.get("target_bonus_usd"))
+
+    # If the filing gives a % bonus target, convert to $ using base salary
+    if target_bonus_usd is None and target_bonus_pct is not None and base_salary_usd is not None:
+        try:
+            target_bonus_usd = int(round(base_salary_usd * (target_bonus_pct / 100.0)))
+        except Exception:
+            pass
+
+    equity_annual_usd = _to_int(comp.get("equity_target_annual_usd_total"))
+
+    # One-time cash: prefer curated field; fall back to older sign_on_bonus_usd
+    one_time_cash_usd_total = _to_int(comp.get("one_time_cash_usd_total"))
+    if one_time_cash_usd_total is None:
+        one_time_cash_usd_total = _to_int(comp.get("sign_on_bonus_usd"))
+
+    one_time_cash_values = comp.get("one_time_cash_values") or []
+    if not one_time_cash_values and comp.get("sign_on_bonus"):
+        one_time_cash_values = [comp.get("sign_on_bonus")]
+
+    # One-time equity (new hire / signing / inducement / make-whole)
+    equity_one_time_usd_total = _to_int(comp.get("equity_one_time_usd_total"))
+    equity_one_time_values = comp.get("equity_one_time_values") or []
+    equity_one_time_labels = comp.get("equity_one_time_labels") or []
+
+    # Annual/target equity/LTI values (ongoing)
+    equity_target_values = comp.get("equity_target_annual_values") or []
+
+    # Target total comp (salary + target bonus $ + annual/ongoing equity/LTI target $)
+    target_total_comp_usd = None
+    if base_salary_usd is not None or target_bonus_usd is not None or equity_annual_usd is not None:
+        target_total_comp_usd = int((base_salary_usd or 0) + (target_bonus_usd or 0) + (equity_annual_usd or 0))
+
+    # A short human-readable summary
+    parts = []
+    if base_salary_usd is not None:
+        parts.append(f"Salary ${base_salary_usd:,}")
+    if target_bonus_usd is not None:
+        if target_bonus_pct is not None:
+            parts.append(f"Target bonus ${target_bonus_usd:,} ({target_bonus_pct:g}%)")
+        else:
+            parts.append(f"Target bonus ${target_bonus_usd:,}")
+    if equity_annual_usd is not None:
+        parts.append(f"Target/annual equity ${equity_annual_usd:,}")
+    if one_time_cash_usd_total is not None:
+        parts.append(f"One-time cash ${one_time_cash_usd_total:,}")
+    if equity_one_time_usd_total is not None:
+        lab = f" ({', '.join(equity_one_time_labels)})" if equity_one_time_labels else ""
+        parts.append(f"One-time equity ${equity_one_time_usd_total:,}" + lab)
+
+    return {
+        "base_salary_usd": base_salary_usd,
+        "target_bonus_pct": target_bonus_pct,
+        "target_bonus_usd": target_bonus_usd,
+        "equity_target_annual_usd_total": equity_annual_usd,
+        "target_total_comp_usd": target_total_comp_usd,
+        "one_time_cash_usd_total": one_time_cash_usd_total,
+        "one_time_cash_values": "; ".join([str(x) for x in one_time_cash_values if x]),
+        "equity_one_time_usd_total": equity_one_time_usd_total,
+        "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
+        "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
+        "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
+        "other_keywords": ", ".join(other),
+        "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
+        "source_8k_url": source_8k_url,
+        "primary_doc_url": primary_doc_url,
+    }
+
+
 def load_events_from_db(tickers: List[str], position: str, lookback_months: int, as_of_date: dt.date) -> pd.DataFrame:
+    """Load matching events from SQLite and expand curated columns."""
     if not DB_PATH.exists():
         return pd.DataFrame()
 
@@ -179,111 +300,13 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=cols)
-# Expand curated compensation fields from raw_json
-def comp_fields(raw: str) -> Dict[str, object]:
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return {}
 
-    comp = (obj.get("compensation") or {})
-    filing = (obj.get("filing") or {})
-    other = comp.get("other") or []
-
-    # Build URLs from filing fields (dataclasses.asdict doesn't include computed properties)
-    source_8k_url = ""
-    primary_doc_url = ""
-    try:
-        cik = str(filing.get("cik") or "")
-        accession = str(filing.get("accession") or "")
-        primary_doc = str(filing.get("primary_doc") or "")
-        if cik.isdigit() and accession:
-            cik_int = int(cik)
-            acc_no = accession.replace("-", "")
-            source_8k_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{accession}-index.html"
-            if primary_doc:
-                primary_doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
-    except Exception:
-        pass
-
-    # Numeric core comp fields (USD assumed)
-    base_salary_usd = comp.get("base_salary_usd")
-    target_bonus_pct = comp.get("target_bonus_pct")
-    target_bonus_usd = comp.get("target_bonus_usd")
-
-    # If the filing gives a % bonus target, convert to $ using base salary
-    if target_bonus_usd in (None, "") and target_bonus_pct not in (None, "") and base_salary_usd not in (None, ""):
-        try:
-            target_bonus_usd = int(round(float(base_salary_usd) * (float(target_bonus_pct) / 100.0)))
-        except Exception:
-            pass
-
-    equity_annual_usd = comp.get("equity_target_annual_usd_total")
-
-    # One-time cash: prefer curated field; fall back to older sign_on_bonus_usd
-    one_time_cash_usd_total = comp.get("one_time_cash_usd_total")
-    if one_time_cash_usd_total in (None, ""):
-        one_time_cash_usd_total = comp.get("sign_on_bonus_usd")
-
-    one_time_cash_values = comp.get("one_time_cash_values") or []
-    if not one_time_cash_values and comp.get("sign_on_bonus"):
-        one_time_cash_values = [comp.get("sign_on_bonus")]
-
-    # One-time equity (new hire / signing / inducement / make-whole)
-    equity_one_time_usd_total = comp.get("equity_one_time_usd_total")
-    equity_one_time_values = comp.get("equity_one_time_values") or []
-    equity_one_time_labels = comp.get("equity_one_time_labels") or []
-
-    # Annual/target equity/LTI values (ongoing)
-    equity_target_values = comp.get("equity_target_annual_values") or []
-
-    # Target total comp (salary + target bonus $ + annual/ongoing equity/LTI target $)
-    target_total_comp_usd = None
-    if base_salary_usd not in (None, "") or target_bonus_usd not in (None, "") or equity_annual_usd not in (None, ""):
-        try:
-            target_total_comp_usd = int((base_salary_usd or 0) + (target_bonus_usd or 0) + (equity_annual_usd or 0))
-        except Exception:
-            pass
-
-    # A short human-readable summary
-    parts = []
-    if base_salary_usd not in (None, ""):
-        parts.append(f"Salary ${int(base_salary_usd):,}")
-    if target_bonus_usd not in (None, ""):
-        if target_bonus_pct not in (None, ""):
-            parts.append(f"Target bonus ${int(target_bonus_usd):,} ({float(target_bonus_pct):g}%)")
-        else:
-            parts.append(f"Target bonus ${int(target_bonus_usd):,}")
-    if equity_annual_usd not in (None, ""):
-        parts.append(f"Target/annual equity ${int(equity_annual_usd):,}")
-    if one_time_cash_usd_total not in (None, ""):
-        parts.append(f"One-time cash ${int(one_time_cash_usd_total):,}")
-    if equity_one_time_usd_total not in (None, ""):
-        lab = f" ({', '.join(equity_one_time_labels)})" if equity_one_time_labels else ""
-        parts.append(f"One-time equity ${int(equity_one_time_usd_total):,}" + lab)
-
-    return {
-        "base_salary_usd": base_salary_usd,
-        "target_bonus_pct": target_bonus_pct,
-        "target_bonus_usd": target_bonus_usd,
-        "equity_target_annual_usd_total": equity_annual_usd,
-        "target_total_comp_usd": target_total_comp_usd,
-        "one_time_cash_usd_total": one_time_cash_usd_total,
-        "one_time_cash_values": "; ".join([str(x) for x in one_time_cash_values if x]),
-        "equity_one_time_usd_total": equity_one_time_usd_total,
-        "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
-        "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
-        "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
-        "other_keywords": ", ".join(other),
-        "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
-        "source_8k_url": source_8k_url,
-        "primary_doc_url": primary_doc_url,
-    }
-
-    expanded = df["raw_json"].apply(comp_fields).apply(pd.Series)
+    # Expand curated compensation fields from raw_json
+    expanded = df["raw_json"].apply(_comp_fields_from_raw_json).apply(pd.Series)
     df = pd.concat([df.drop(columns=["raw_json"]), expanded], axis=1)
 
     df = df.rename(columns={"person": "new_executive", "matched_title": "position"})
+
     ordered = [
         "ticker",
         "company_name",
@@ -311,8 +334,6 @@ def comp_fields(raw: str) -> Dict[str, object]:
     ]
     df = df[[c for c in ordered if c in df.columns]]
     return df
-
-
 # ----------
 # UI
 # ----------
@@ -428,6 +449,9 @@ st.divider()
 st.subheader("Results")
 results = load_events_from_db(watchlist, position=position, lookback_months=lookback_months, as_of_date=as_of_date)
 
+if results is None:
+    results = pd.DataFrame()
+
 if results.empty:
     st.info("No matching executive appointment events found in the selected window (or none scanned yet).")
 else:
@@ -435,18 +459,18 @@ else:
         results,
         use_container_width=True,
         hide_index=True,
-column_config={
-    "source_8k_url": st.column_config.LinkColumn("8‑K", display_text="Open 8‑K"),
-    "primary_doc_url": st.column_config.LinkColumn("Primary doc", display_text="Open"),
-    "base_salary_usd": st.column_config.NumberColumn("Salary (USD)"),
-    "target_bonus_pct": st.column_config.NumberColumn("Bonus target (%)"),
-    "target_bonus_usd": st.column_config.NumberColumn("Bonus target (USD)"),
-    "equity_target_annual_usd_total": st.column_config.NumberColumn("Annual/target equity (USD)"),
-    "target_total_comp_usd": st.column_config.NumberColumn("Target total comp (USD)"),
-    "one_time_cash_usd_total": st.column_config.NumberColumn("One-time cash (USD)"),
-    "equity_one_time_usd_total": st.column_config.NumberColumn("One-time equity (USD)"),
-    "confidence": st.column_config.NumberColumn("Confidence"),
-},
+        column_config={
+            "source_8k_url": st.column_config.LinkColumn("8‑K", display_text="Open 8‑K"),
+            "primary_doc_url": st.column_config.LinkColumn("Primary doc", display_text="Open"),
+            "base_salary_usd": st.column_config.NumberColumn("Salary (USD)"),
+            "target_bonus_pct": st.column_config.NumberColumn("Bonus target (%)"),
+            "target_bonus_usd": st.column_config.NumberColumn("Bonus target (USD)"),
+            "equity_target_annual_usd_total": st.column_config.NumberColumn("Annual/target equity (USD)"),
+            "target_total_comp_usd": st.column_config.NumberColumn("Target total comp (USD)"),
+            "one_time_cash_usd_total": st.column_config.NumberColumn("One-time cash (USD)"),
+            "equity_one_time_usd_total": st.column_config.NumberColumn("One-time equity (USD)"),
+            "confidence": st.column_config.NumberColumn("Confidence"),
+        },
     )
 
     # Download CSV
