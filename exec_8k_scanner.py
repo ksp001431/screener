@@ -165,6 +165,14 @@ class ExtractedComp:
     target_bonus_usd: Optional[int] = None
     sign_on_bonus_usd: Optional[int] = None
 
+
+    # One-time cash (signing / inducement / make-whole / one-time payments)
+    one_time_cash_values: List[str] = dataclasses.field(default_factory=list)
+    one_time_cash_values_usd: List[int] = dataclasses.field(default_factory=list)
+    one_time_cash_usd_total: Optional[int] = None
+    one_time_cash_details: List[str] = dataclasses.field(default_factory=list)
+
+
     equity_target_annual_values_usd: List[int] = dataclasses.field(default_factory=list)
     equity_target_annual_usd_total: Optional[int] = None
 
@@ -266,10 +274,7 @@ class Store:
             (
                 filing.accession,
                 position_query,
-                # Use timezone-aware UTC timestamps (avoids DeprecationWarning on utcnow()).
-                dt.datetime.now(getattr(dt, "UTC", dt.timezone.utc))
-                .isoformat(timespec="seconds")
-                .replace("+00:00", "Z"),
+                dt.datetime.now(getattr(dt, "UTC", dt.timezone.utc)).isoformat(timespec="seconds").replace("+00:00","Z"),
             ),
         )
         self.conn.commit()
@@ -315,6 +320,35 @@ ITEM_HDR_RE = re.compile(r"\bItem\s+(\d+)\.(\d+)\b", re.IGNORECASE)
 
 def norm_ws(s: str) -> str:
     return WS_RE.sub(" ", s).strip()
+
+
+def sentence_snippet(text: str, start: int, end: int, max_len: int = 420) -> str:
+    """Extract a sentence-ish snippet around a match to avoid mixing adjacent comp terms."""
+    if not text:
+        return ""
+    n = len(text)
+    start = max(0, min(start, n))
+    end = max(0, min(end, n))
+
+    left_bound = max(0, start - max_len)
+    left_candidates = [
+        text.rfind(".", left_bound, start),
+        text.rfind(";", left_bound, start),
+        text.rfind("\n", left_bound, start),
+    ]
+    left = max(left_candidates)
+    left = (left + 1) if left != -1 else left_bound
+
+    right_bound = min(n, end + max_len)
+    right_candidates = [
+        text.find(".", end, right_bound),
+        text.find(";", end, right_bound),
+        text.find("\n", end, right_bound),
+    ]
+    right_hits = [i for i in right_candidates if i != -1]
+    right = min(right_hits) if right_hits else right_bound
+
+    return norm_ws(text[left:right])[:max_len]
 
 def parse_date(s: str) -> Optional[str]:
     s = s.strip()
@@ -891,7 +925,7 @@ APPOINT_VERBS = [
     r"hire(?:d|s)?",
 ]
 
-NAME_RE = r"(?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*(?:[A-Z][A-Za-z\.\-’']+)(?:\s+[A-Z][A-Za-z\.\-’']+){1,4}"
+NAME_RE = r"(?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*(?:(?-i:[A-Z][A-Za-z\.\-’\']+))(?:\s+(?:(?-i:[A-Z][A-Za-z\.\-’\']+))){1,4}"
 
 EFFECTIVE_DATE_RE = re.compile(
     r"(?:effective|with effect|as of)\s+(?:on\s+)?(?P<date>(?:\w+\s+\d{1,2},\s+\d{4})|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})",
@@ -1040,13 +1074,20 @@ COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("target_bonus", re.compile(rf"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("sign_on_bonus", re.compile(rf"\b(sign(?:ing)?-?on bonus|one-time (?:cash )?(?:signing|sign-on) bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
 
+    ("one_time_cash", re.compile(rf"\b(sign(?:ing)?(?:-?on)?\s+bonus|signing bonus|sign-?on bonus|inducement|make-?whole|make whole)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("one_time_cash", re.compile(rf"({DOLLAR_RE})[^.:\n]{{0,80}}?\b(sign(?:ing)?(?:-?on)?\s+bonus|signing bonus|sign-?on bonus|inducement|make-?whole|make whole)\b", re.IGNORECASE)),  # money-before-label
+
+    ("one_time_cash", re.compile(rf"\b(one-?time|one time)\b[^.:\n]{{0,80}}?\b(?:cash\s+)?(?:bonus|payment)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("one_time_cash", re.compile(rf"\blump sum payment\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
+
     # Equity / LTI - shares/units or $ value
     ("equity_award", re.compile(r"\b(restricted stock units|RSUs)\b[^.:\n]{0,260}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares|units)", re.IGNORECASE)),
     ("equity_award", re.compile(r"\b(stock option|options?)\b[^.:\n]{0,280}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares)", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(restricted stock units|RSUs|stock options?|option award)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(long-?term incentive|LTI|equity incentive|target award value|grant date value)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(annual|target)\b[^.:\n]{0,240}?\b(long-?term incentive|LTI|equity)\b[^.:\n]{0,240}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(inducement|make-?whole|make whole|sign(?:ing)?|new hire|initial|one-?time)\b[^.:\n]{0,240}?\b(award|grant|RSUs?|restricted stock|equity|stock options?)\b[^.:\n]{0,240}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(annual|target)\b[^.:\n]{{0,240}}?\b(long-?term incentive|LTI|equity)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(equity\s+grant\s+opportunity|annual\s+equity\s+grant\s+opportunity|target\s+annual\s+equity\s+grant\s+opportunity|equity\s+grant)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(inducement|make-?whole|make whole|sign(?:ing)?|new hire|initial|one-?time)\b[^.:\n]{{0,240}}?\b(award|grant|RSUs?|restricted stock|equity|stock options?)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
 
     # Severance / CIC
     ("severance", re.compile(r"\bseverance\b[^.:\n]{0,320}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE)),
@@ -1181,8 +1222,13 @@ def extract_compensation(text: str) -> ExtractedComp:
             elif field == "sign_on_bonus" and comp.sign_on_bonus is None:
                 comp.sign_on_bonus = money_norm(m.group(2))
                 comp.sign_on_bonus_usd = money_to_usd(comp.sign_on_bonus)
+            elif field == "one_time_cash":
+                cash_snip = sentence_snippet(text, m.start(), m.end())
+                comp.one_time_cash_details.append(cash_snip)
+                comp.one_time_cash_values.extend(_extract_money_strings(cash_snip))
+
             elif field == "equity_award":
-                comp.equity_awards.append(snippet[:360])
+                comp.equity_awards.append(sentence_snippet(text, m.start(), m.end()))
             elif field == "severance":
                 comp.severance.append(snippet[:360])
 
@@ -1222,6 +1268,8 @@ def extract_compensation(text: str) -> ExtractedComp:
     comp.equity_target_annual_details = _dedupe(comp.equity_target_annual_details)
     comp.equity_one_time_values = _dedupe(comp.equity_one_time_values)
     comp.equity_one_time_labels = _dedupe(comp.equity_one_time_labels)
+    comp.one_time_cash_values = _dedupe(comp.one_time_cash_values)
+    comp.one_time_cash_details = _dedupe(comp.one_time_cash_details)
     # Numeric equity (USD) + totals for spreadsheets
     def _dedupe_int(seq: List[Optional[int]]) -> List[int]:
         seen_i: Set[int] = set()
@@ -1234,6 +1282,10 @@ def extract_compensation(text: str) -> ExtractedComp:
             seen_i.add(v)
             out_i.append(v)
         return out_i
+
+    # Numeric one-time cash (USD) + total
+    comp.one_time_cash_values_usd = _dedupe_int([money_to_usd(x) for x in comp.one_time_cash_values])
+    comp.one_time_cash_usd_total = int(sum(comp.one_time_cash_values_usd)) if comp.one_time_cash_values_usd else None
 
     comp.equity_target_annual_values_usd = _dedupe_int([money_to_usd(x) for x in comp.equity_target_annual_values])
     comp.equity_one_time_values_usd = _dedupe_int([money_to_usd(x) for x in comp.equity_one_time_values])
@@ -1249,6 +1301,14 @@ def extract_compensation(text: str) -> ExtractedComp:
     comp.severance = _dedupe(comp.severance)
     comp.other = _dedupe(comp.other)
     comp.evidence_snippets = _dedupe(comp.evidence_snippets)
+    # Compute target_bonus_usd from pct if needed (common in filings)
+    if comp.target_bonus_usd is None and comp.target_bonus_pct is not None and comp.base_salary_usd is not None:
+        try:
+            comp.target_bonus_usd = int(round(comp.base_salary_usd * (float(comp.target_bonus_pct) / 100.0)))
+        except Exception:
+            pass
+
+
     return comp
 
 def compensation_brief(comp: ExtractedComp) -> str:
@@ -1257,8 +1317,8 @@ def compensation_brief(comp: ExtractedComp) -> str:
         bits.append(f"Base salary {comp.base_salary}")
     if comp.target_bonus:
         bits.append(f"Target bonus {comp.target_bonus}")
-    if comp.sign_on_bonus:
-        bits.append(f"Sign-on {comp.sign_on_bonus}")
+    if comp.one_time_cash_usd_total is not None:
+        bits.append(f"One-time cash ${comp.one_time_cash_usd_total:,}")
 
     if comp.equity_target_annual_values:
         bits.append("Equity target/annual " + ", ".join(comp.equity_target_annual_values))
@@ -1404,34 +1464,31 @@ def write_outputs(
     if out_csv:
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
-            "company_name",
             "ticker",
-            "cik",
+            "company_name",
             "filing_date",
-            "form",
+            "source_8k_url",
             "accession",
+            "form",
             "new_executive",
             "position",
             "effective_date",
             "event_type",
-            "base_salary",
-            "target_bonus",
-            "sign_on_bonus",
             "base_salary_usd",
             "target_bonus_pct",
             "target_bonus_usd",
-            "sign_on_bonus_usd",
-            "equity_target_annual_values",
+            "equity_target_annual_usd_total",
+            "target_total_comp_usd",
+            "one_time_cash_usd_total",
+            "one_time_cash_values",
+            "equity_one_time_usd_total",
             "equity_one_time_values",
             "equity_one_time_labels",
-            "equity_target_annual_usd_total",
-            "equity_one_time_usd_total",
-            "equity_total_usd",
-            "severance_mentions_count",
+            "equity_target_annual_values",
             "other_keywords",
-            "compensation_brief",
-            "source_8k_url",
+            "compensation_summary",
             "primary_doc_url",
+            "confidence",
         ]
         exists = out_csv.exists()
         with out_csv.open("a", encoding="utf-8", newline="") as f:
@@ -1440,36 +1497,47 @@ def write_outputs(
                 w.writeheader()
             for e in events:
                 comp = e.compensation or ExtractedComp()
+
+                # Derived numeric values: salary + target bonus ($) + annual/ongoing equity/LTI target ($)
+                base = comp.base_salary_usd
+                bonus_usd = comp.target_bonus_usd
+                if bonus_usd is None and comp.target_bonus_pct is not None and base is not None:
+                    try:
+                        bonus_usd = int(round(base * (float(comp.target_bonus_pct) / 100.0)))
+                    except Exception:
+                        bonus_usd = None
+                equity_annual = comp.equity_target_annual_usd_total
+                target_total = None
+                if base is not None or bonus_usd is not None or equity_annual is not None:
+                    target_total = int((base or 0) + (bonus_usd or 0) + (equity_annual or 0))
+
                 w.writerow(
                     {
-                        "company_name": e.filing.company_name or "",
                         "ticker": e.filing.ticker or "",
-                        "cik": e.filing.cik,
+                        "company_name": e.filing.company_name or "",
                         "filing_date": e.filing.filing_date,
-                        "form": e.filing.form,
+                        "source_8k_url": e.filing.index_html_url(),
                         "accession": e.filing.accession,
+                        "form": e.filing.form,
                         "new_executive": e.person or "",
                         "position": e.matched_title or "",
                         "effective_date": e.effective_date or "",
                         "event_type": e.event_type or "",
-                        "base_salary": comp.base_salary or "",
-                        "target_bonus": comp.target_bonus or "",
-                        "sign_on_bonus": comp.sign_on_bonus or "",
-                        "base_salary_usd": "" if comp.base_salary_usd is None else comp.base_salary_usd,
+                        "base_salary_usd": "" if base is None else base,
                         "target_bonus_pct": "" if comp.target_bonus_pct is None else comp.target_bonus_pct,
-                        "target_bonus_usd": "" if comp.target_bonus_usd is None else comp.target_bonus_usd,
-                        "sign_on_bonus_usd": "" if comp.sign_on_bonus_usd is None else comp.sign_on_bonus_usd,
-                        "equity_target_annual_values": "; ".join(comp.equity_target_annual_values),
+                        "target_bonus_usd": "" if bonus_usd is None else bonus_usd,
+                        "equity_target_annual_usd_total": "" if equity_annual is None else equity_annual,
+                        "target_total_comp_usd": "" if target_total is None else target_total,
+                        "one_time_cash_usd_total": "" if comp.one_time_cash_usd_total is None else comp.one_time_cash_usd_total,
+                        "one_time_cash_values": "; ".join(comp.one_time_cash_values),
+                        "equity_one_time_usd_total": "" if comp.equity_one_time_usd_total is None else comp.equity_one_time_usd_total,
                         "equity_one_time_values": "; ".join(comp.equity_one_time_values),
                         "equity_one_time_labels": ", ".join(comp.equity_one_time_labels),
-                        "equity_target_annual_usd_total": "" if comp.equity_target_annual_usd_total is None else comp.equity_target_annual_usd_total,
-                        "equity_one_time_usd_total": "" if comp.equity_one_time_usd_total is None else comp.equity_one_time_usd_total,
-                        "equity_total_usd": "" if comp.equity_total_usd is None else comp.equity_total_usd,
-                        "severance_mentions_count": str(len(comp.severance)),
+                        "equity_target_annual_values": "; ".join(comp.equity_target_annual_values),
                         "other_keywords": ", ".join(comp.other),
-                        "compensation_brief": compensation_brief(comp),
-                        "source_8k_url": e.filing.index_html_url(),
+                        "compensation_summary": compensation_brief(comp),
                         "primary_doc_url": e.filing.primary_url(),
+                        "confidence": e.confidence,
                     }
                 )
 
@@ -1483,7 +1551,6 @@ def write_outputs(
                     f.write("\n\nEvidence snippets (review filing for full context):\n")
                     for snip in e.compensation.evidence_snippets[:6]:
                         f.write(f"- {snip}\n")
-
 
 # -----------------------------
 # CLI
