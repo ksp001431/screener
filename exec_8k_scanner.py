@@ -484,6 +484,14 @@ class FilingDocument:
     url: str
 
 def parse_filing_index_html(client: SecEdgarClient, filing: FilingRef) -> List[FilingDocument]:
+    """
+    Parse the SEC filing "-index.html" page and return a list of documents.
+
+    IMPORTANT: The "Document" column can include Inline XBRL viewer links like:
+        ix?doc=/Archives/edgar/data/.../file.htm
+    and/or a separate "iXBRL" link/label. We must avoid mistakenly treating those
+    as the primary document filename (e.g., "ix" or "file.htm iXBRL").
+    """
     html = client.get_text(filing.index_html_url())
     soup = BeautifulSoup(html, "lxml")
 
@@ -493,51 +501,102 @@ def parse_filing_index_html(client: SecEdgarClient, filing: FilingRef) -> List[F
         return docs
 
     rows = table.find_all("tr")
+
+    # Used to derive a safe "filename" from hrefs
+    base = filing.base_dir_url()
+    base_noscheme = base.replace("https://www.sec.gov", "")
+
+    # Local import to avoid adding a hard dependency elsewhere
+    from urllib.parse import urlparse, parse_qs, unquote
+
+    def _unwrap_ix_href(href: str) -> str:
+        """
+        If href is an Inline XBRL viewer link like 'ix?doc=/Archives/.../file.htm',
+        return the underlying doc path; otherwise return href unchanged.
+        """
+        h = href.strip()
+        low = h.lower()
+        if low.startswith("ix?") or low.startswith("/ix?"):
+            abs_ix = "https://www.sec.gov" + h if h.startswith("/") else "https://www.sec.gov/" + h
+            q = parse_qs(urlparse(abs_ix).query)
+            doc = q.get("doc", [None])[0]
+            if doc:
+                return unquote(doc)
+        return h
+
+    def _looks_like_file(s: str) -> bool:
+        return bool(re.search(r"\.(?:htm|html|txt|xml|pdf)$", s or "", flags=re.IGNORECASE))
+
     for r in rows[1:]:
         cols = r.find_all("td")
         if len(cols) < 4:
             continue
+
         description = norm_ws(cols[1].get_text(" ", strip=True))
         doc_type = norm_ws(cols[3].get_text(" ", strip=True))
 
-        # The "Document" cell may contain both:
-        #   <a>somefile.htm</a>  <a>iXBRL</a>
-        # If we read the whole cell text, we can end up with
-        # "somefile.htm iXBRL" and later request ".../somefile.htm%20iXBRL" (404).
         links = cols[2].find_all("a")
         if not links:
             continue
 
-        # Prefer a link whose visible text looks like a filename
-        doc_link = None
-        for a in links:
-            t = a.get_text(" ", strip=True)
-            if re.search(r"\.(?:htm|html|txt|xml)$", t, flags=re.IGNORECASE):
-                doc_link = a
-                break
-        if doc_link is None:
-            doc_link = links[0]
+        # Choose the best candidate link for the underlying document.
+        # Prefer a link whose visible text OR underlying href/doc path looks like a real file,
+        # and avoid selecting the iXBRL label link.
+        best_a = None
+        best_score = -1
+        best_href_resolved = None
 
-        href = doc_link.get("href")
+        for a in links:
+            t = (a.get_text(" ", strip=True) or "").strip()
+            if t.lower() == "ixbrl":
+                continue  # label link, not the doc
+
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+
+            href_resolved = _unwrap_ix_href(href)
+
+            # Score candidates
+            score = 0
+            if _looks_like_file(t):
+                score += 3
+            if _looks_like_file(href_resolved):
+                score += 3
+
+            # Penalize bare ix/ixviewer links if not unwrapped
+            href_noq = href.split("?", 1)[0].split("#", 1)[0].strip().lower()
+            if href_noq in ("ix", "/ix") or "ixviewer" in href_noq:
+                score -= 2
+
+            if score > best_score:
+                best_score = score
+                best_a = a
+                best_href_resolved = href_resolved
+
+        # Fallback if nothing scored well (rare)
+        if best_a is None:
+            best_a = links[0]
+            best_href_resolved = _unwrap_ix_href((best_a.get("href") or "").strip())
+
+        href = (best_href_resolved or "").strip()
         if not href:
             continue
-        href = href.strip()
 
         # Build absolute fetch URL
-        if href.startswith("/"):
-            url = "https://www.sec.gov" + href
-            href_clean = href
-        elif href.startswith("http"):
+        if href.startswith("http"):
             url = href
             href_clean = href
+        elif href.startswith("/"):
+            url = "https://www.sec.gov" + href
+            href_clean = href
         else:
+            # Some hrefs are relative to the filing directory (e.g., "file.htm")
             url = filing.base_dir_url() + href
             href_clean = href
 
-        # Derive a clean filename/relative path from href
+        # Derive a clean filename/relative path from the href (strip query/fragment)
         href_clean = href_clean.split("?", 1)[0].split("#", 1)[0]
-        base = filing.base_dir_url()
-        base_noscheme = base.replace("https://www.sec.gov", "")
 
         if href_clean.startswith(base):
             filename = href_clean[len(base):]
@@ -548,23 +607,22 @@ def parse_filing_index_html(client: SecEdgarClient, filing: FilingRef) -> List[F
         else:
             filename = href_clean  # preserve relative subpaths if any
 
-        filename = filename.strip()
+        filename = filename.strip().split()[0]  # safety net vs "file.htm iXBRL"
 
         docs.append(FilingDocument(filename, description, doc_type, url))
-       
-    return docs
 
+    return docs
 def pick_primary_doc(filing: FilingRef, docs: List[FilingDocument]) -> FilingRef:
     if filing.primary_doc:
         return filing
 
     for d in docs:
         if d.doc_type in ("8-K", "8-K/A"):
-            return dataclasses.replace(filing, primary_doc=d.filename)
+            return dataclasses.replace(filing, primary_doc=d.filename.split()[0])
 
     for d in docs:
         if re.search(r"8k(\.htm|\.html|\.txt)$", d.filename, flags=re.I):
-            return dataclasses.replace(filing, primary_doc=d.filename)
+            return dataclasses.replace(filing, primary_doc=d.filename.split()[0])
 
     for d in docs:
         if d.filename.lower().endswith((".htm", ".html")):
@@ -572,7 +630,7 @@ def pick_primary_doc(filing: FilingRef, docs: List[FilingDocument]) -> FilingRef
 
     # last resort: first doc
     if docs:
-        return dataclasses.replace(filing, primary_doc=docs[0].filename)
+        return dataclasses.replace(filing, primary_doc=docs[0].filename.split()[0])
 
     return filing
 
@@ -671,25 +729,34 @@ class ExecMatch:
     effective_date: Optional[str]
 
 def _compile_exec_regexes(position_titles: List[str]) -> List[re.Pattern]:
+    """
+    Build regexes that try to catch common appointment language in Item 5.02.
+
+    Important nuance: filings often embed the target role inside a longer title, e.g.
+      "Executive Vice President and Chief Financial Officer"
+    so we match titles that *contain* one of the requested position tokens.
+    """
     # escape titles to treat them as literals inside regex
     title_alt = "|".join(re.escape(t) for t in position_titles if t.strip())
-    # Allow a small suffix like "of the Company"
-    title_re = rf"(?P<title>(?:{title_alt}))(?:\s+(?:of|for)\s+(?:the\s+)?Company)?"
 
+    # Title phrase that CONTAINS one of the key titles, bounded by sentence-ish punctuation.
+    # Example match: "Executive Vice President and Chief Financial Officer"
+    title_re = rf"(?P<title>[^.;\n]{{0,100}}?\b(?:{title_alt})\b[^.;\n]{{0,100}}?)"
     verbs_alt = "|".join(APPOINT_VERBS)
 
     patterns = [
         # "appointed John Doe as Chief Financial Officer"
-        rf"\b(?P<lemma>{verbs_alt})\b\s+(?P<name>{NAME_RE})\s+(?:as|to serve as|to be)\s+(?:the\s+)?{title_re}",
+        rf"\b(?P<lemma>{verbs_alt})\b\s+(?P<name>{NAME_RE})\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe was appointed as Chief Financial Officer"
-        rf"(?P<name>{NAME_RE})\s+(?:has been|was|is)\s+\b(?P<lemma>{verbs_alt})\b\s+(?:as|to serve as|to be)\s+(?:the\s+)?{title_re}",
+        rf"(?P<name>{NAME_RE})\s+(?:has been|was|is)\s+\b(?P<lemma>{verbs_alt})\b\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
+        # "the appointment of John Doe to serve as Chief Financial Officer"
+        rf"\bappointment\s+of\s+(?P<name>{NAME_RE})\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe will serve as Chief Financial Officer"
-        rf"(?P<name>{NAME_RE})\s+will\s+(?:serve|act)\s+as\s+(?:the\s+)?{title_re}",
+        rf"(?P<name>{NAME_RE})\s+will\s+(?:serve|act)\s+as\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe will assume the role of Chief Financial Officer"
         rf"(?P<name>{NAME_RE})\s+will\s+assum(?:e|ing)\s+(?:the\s+)?(?:role\s+of\s+)?{title_re}",
     ]
     return [re.compile(p, flags=re.IGNORECASE) for p in patterns]
-
 def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str, Any], List[ExecMatch]]:
     """
     Detect matches for the requested position in Item 5.02 context.
@@ -772,9 +839,14 @@ COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("target_bonus", re.compile(r"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity)\b[^.:\n]{0,220}?(\d{1,3}\s?%)", re.IGNORECASE)),
     ("target_bonus", re.compile(rf"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("sign_on_bonus", re.compile(rf"\b(sign(?:ing)?-?on bonus|one-time (?:cash )?(?:signing|sign-on) bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
+
+    # Equity / LTI - shares/units or $ value
     ("equity_award", re.compile(r"\b(restricted stock units|RSUs)\b[^.:\n]{0,260}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares|units)", re.IGNORECASE)),
     ("equity_award", re.compile(r"\b(stock option|options?)\b[^.:\n]{0,280}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares)", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(restricted stock units|RSUs|stock options?|option award)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(long-?term incentive|LTI|equity incentive|target award value|grant date value)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
+
+    # Severance / CIC
     ("severance", re.compile(r"\bseverance\b[^.:\n]{0,320}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE)),
     ("severance", re.compile(r"\bchange in control\b[^.:\n]{0,340}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE)),
     ("severance", re.compile(r"\bseverance\b[^.:\n]{0,340}?\b(\d(?:\.\d)?)\s?x\b", re.IGNORECASE)),
