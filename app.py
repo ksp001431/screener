@@ -135,128 +135,12 @@ def run_scan(
         return proc.returncode, proc.stdout, proc.stderr
 
 
-# ----------
-# Results loader
-# ----------
-
-def _to_int(x):
-    try:
-        if x is None or x == "":
-            return None
-        return int(float(x))
-    except Exception:
-        return None
-
-def _to_float(x):
-    try:
-        if x is None or x == "":
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _comp_fields_from_raw_json(raw: str) -> Dict[str, object]:
-    """Expand curated compensation + source URLs from the stored raw_json."""
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return {}
-
-    comp = (obj.get("compensation") or {})
-    filing = (obj.get("filing") or {})
-    other = comp.get("other") or []
-
-    # Build URLs from filing fields (dataclasses.asdict doesn't include computed properties)
-    source_8k_url = ""
-    primary_doc_url = ""
-    try:
-        cik = str(filing.get("cik") or "")
-        accession = str(filing.get("accession") or "")
-        primary_doc = str(filing.get("primary_doc") or "")
-        if cik.isdigit() and accession:
-            cik_int = int(cik)
-            acc_no = accession.replace("-", "")
-            source_8k_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{accession}-index.html"
-            if primary_doc:
-                primary_doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
-    except Exception:
-        pass
-
-    # Numeric core comp fields (USD assumed)
-    base_salary_usd = _to_int(comp.get("base_salary_usd"))
-    target_bonus_pct = _to_float(comp.get("target_bonus_pct"))
-    target_bonus_usd = _to_int(comp.get("target_bonus_usd"))
-
-    # If the filing gives a % bonus target, convert to $ using base salary
-    if target_bonus_usd is None and target_bonus_pct is not None and base_salary_usd is not None:
-        try:
-            target_bonus_usd = int(round(base_salary_usd * (target_bonus_pct / 100.0)))
-        except Exception:
-            pass
-
-    equity_annual_usd = _to_int(comp.get("equity_target_annual_usd_total"))
-
-    # One-time cash: prefer curated field; fall back to older sign_on_bonus_usd
-    one_time_cash_usd_total = _to_int(comp.get("one_time_cash_usd_total"))
-    if one_time_cash_usd_total is None:
-        one_time_cash_usd_total = _to_int(comp.get("sign_on_bonus_usd"))
-
-    one_time_cash_values = comp.get("one_time_cash_values") or []
-    if not one_time_cash_values and comp.get("sign_on_bonus"):
-        one_time_cash_values = [comp.get("sign_on_bonus")]
-
-    # One-time equity (new hire / signing / inducement / make-whole)
-    equity_one_time_usd_total = _to_int(comp.get("equity_one_time_usd_total"))
-    equity_one_time_values = comp.get("equity_one_time_values") or []
-    equity_one_time_labels = comp.get("equity_one_time_labels") or []
-
-    # Annual/target equity/LTI values (ongoing)
-    equity_target_values = comp.get("equity_target_annual_values") or []
-
-    # Target total comp (salary + target bonus $ + annual/ongoing equity/LTI target $)
-    target_total_comp_usd = None
-    if base_salary_usd is not None or target_bonus_usd is not None or equity_annual_usd is not None:
-        target_total_comp_usd = int((base_salary_usd or 0) + (target_bonus_usd or 0) + (equity_annual_usd or 0))
-
-    # A short human-readable summary
-    parts = []
-    if base_salary_usd is not None:
-        parts.append(f"Salary ${base_salary_usd:,}")
-    if target_bonus_usd is not None:
-        if target_bonus_pct is not None:
-            parts.append(f"Target bonus ${target_bonus_usd:,} ({target_bonus_pct:g}%)")
-        else:
-            parts.append(f"Target bonus ${target_bonus_usd:,}")
-    if equity_annual_usd is not None:
-        parts.append(f"Target/annual equity ${equity_annual_usd:,}")
-    if one_time_cash_usd_total is not None:
-        parts.append(f"One-time cash ${one_time_cash_usd_total:,}")
-    if equity_one_time_usd_total is not None:
-        lab = f" ({', '.join(equity_one_time_labels)})" if equity_one_time_labels else ""
-        parts.append(f"One-time equity ${equity_one_time_usd_total:,}" + lab)
-
-    return {
-        "base_salary_usd": base_salary_usd,
-        "target_bonus_pct": target_bonus_pct,
-        "target_bonus_usd": target_bonus_usd,
-        "equity_target_annual_usd_total": equity_annual_usd,
-        "target_total_comp_usd": target_total_comp_usd,
-        "one_time_cash_usd_total": one_time_cash_usd_total,
-        "one_time_cash_values": "; ".join([str(x) for x in one_time_cash_values if x]),
-        "equity_one_time_usd_total": equity_one_time_usd_total,
-        "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
-        "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
-        "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
-        "other_keywords": ", ".join(other),
-        "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
-        "source_8k_url": source_8k_url,
-        "primary_doc_url": primary_doc_url,
-    }
-
-
 def load_events_from_db(tickers: List[str], position: str, lookback_months: int, as_of_date: dt.date) -> pd.DataFrame:
-    """Load matching events from SQLite and expand curated columns."""
+    """
+    Load scanned events from the local SQLite DB and expand curated compensation fields from raw_json.
+
+    IMPORTANT: This must ALWAYS return a pandas DataFrame (possibly empty). Returning None will break the UI.
+    """
     if not DB_PATH.exists():
         return pd.DataFrame()
 
@@ -288,21 +172,134 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
     if tickers:
         params.extend(tickers)
 
-    con = sqlite3.connect(DB_PATH)
     try:
-        cur = con.execute(sql, params)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-    finally:
-        con.close()
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(sql, params)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        finally:
+            con.close()
+    except Exception as e:
+        # Don't crash the app if the DB is corrupt/missing tables, etc.
+        st.error(f"Failed to load results from SQLite DB: {e}")
+        return pd.DataFrame()
 
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=cols)
 
-    # Expand curated compensation fields from raw_json
-    expanded = df["raw_json"].apply(_comp_fields_from_raw_json).apply(pd.Series)
+    def comp_fields(raw: str) -> Dict[str, object]:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return {}
+
+        comp = (obj.get("compensation") or {})
+        filing = (obj.get("filing") or {})
+        other = comp.get("other") or []
+
+        # Build URLs from filing fields (dataclasses.asdict doesn't include computed properties)
+        source_8k_url = ""
+        primary_doc_url = ""
+        try:
+            cik = str(filing.get("cik") or "")
+            accession = str(filing.get("accession") or "")
+            primary_doc = str(filing.get("primary_doc") or "")
+            if cik.isdigit() and accession:
+                cik_int = int(cik)
+                acc_no = accession.replace("-", "")
+                source_8k_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{accession}-index.html"
+                if primary_doc:
+                    primary_doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
+        except Exception:
+            pass
+
+        # Numeric core comp fields (USD assumed)
+        base_salary_usd = comp.get("base_salary_usd")
+        target_bonus_pct = comp.get("target_bonus_pct")
+        target_bonus_usd = comp.get("target_bonus_usd")
+
+        # Convert % bonus target to $ if possible
+        if (target_bonus_usd in (None, "")) and (target_bonus_pct not in (None, "")) and (base_salary_usd not in (None, "")):
+            try:
+                target_bonus_usd = int(round(float(base_salary_usd) * (float(target_bonus_pct) / 100.0)))
+            except Exception:
+                pass
+
+        equity_annual_usd = comp.get("equity_target_annual_usd_total")
+
+        # One-time cash: prefer curated field; fall back to older sign_on_bonus_usd
+        one_time_cash_usd_total = comp.get("one_time_cash_usd_total")
+        if one_time_cash_usd_total in (None, ""):
+            one_time_cash_usd_total = comp.get("sign_on_bonus_usd")
+
+        one_time_cash_values = comp.get("one_time_cash_values") or []
+        if (not one_time_cash_values) and comp.get("sign_on_bonus"):
+            one_time_cash_values = [comp.get("sign_on_bonus")]
+
+        # One-time equity (new hire / signing / inducement / make-whole)
+        equity_one_time_usd_total = comp.get("equity_one_time_usd_total")
+        equity_one_time_values = comp.get("equity_one_time_values") or []
+        equity_one_time_labels = comp.get("equity_one_time_labels") or []
+
+        # Annual/target equity/LTI values (ongoing)
+        equity_target_values = comp.get("equity_target_annual_values") or []
+
+        # Target total comp (salary + target bonus $ + annual/ongoing equity/LTI target $)
+        target_total_comp_usd = None
+        try:
+            if base_salary_usd not in (None, "") or target_bonus_usd not in (None, "") or equity_annual_usd not in (None, ""):
+                target_total_comp_usd = int((base_salary_usd or 0) + (target_bonus_usd or 0) + (equity_annual_usd or 0))
+        except Exception:
+            pass
+
+        # A short human-readable summary
+        parts = []
+        try:
+            if base_salary_usd not in (None, ""):
+                parts.append(f"Salary ${int(base_salary_usd):,}")
+            if target_bonus_usd not in (None, ""):
+                if target_bonus_pct not in (None, ""):
+                    parts.append(f"Target bonus ${int(target_bonus_usd):,} ({float(target_bonus_pct):g}%)")
+                else:
+                    parts.append(f"Target bonus ${int(target_bonus_usd):,}")
+            if equity_annual_usd not in (None, ""):
+                parts.append(f"Target/annual equity ${int(equity_annual_usd):,}")
+            if one_time_cash_usd_total not in (None, ""):
+                parts.append(f"One-time cash ${int(one_time_cash_usd_total):,}")
+            if equity_one_time_usd_total not in (None, ""):
+                lab = f" ({', '.join(equity_one_time_labels)})" if equity_one_time_labels else ""
+                parts.append(f"One-time equity ${int(equity_one_time_usd_total):,}" + lab)
+        except Exception:
+            # Don't let formatting errors break the whole table
+            pass
+
+        return {
+            # Key URLs
+            "source_8k_url": source_8k_url,
+            "primary_doc_url": primary_doc_url,
+
+            # Curated numeric fields
+            "base_salary_usd": base_salary_usd,
+            "target_bonus_pct": target_bonus_pct,
+            "target_bonus_usd": target_bonus_usd,
+            "equity_target_annual_usd_total": equity_annual_usd,
+            "target_total_comp_usd": target_total_comp_usd,
+            "one_time_cash_usd_total": one_time_cash_usd_total,
+            "equity_one_time_usd_total": equity_one_time_usd_total,
+
+            # Detail strings for auditability
+            "one_time_cash_values": "; ".join([str(x) for x in one_time_cash_values if x]),
+            "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
+            "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
+            "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
+            "other_keywords": ", ".join(other),
+            "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
+        }
+
+    expanded = df["raw_json"].apply(comp_fields).apply(pd.Series)
     df = pd.concat([df.drop(columns=["raw_json"]), expanded], axis=1)
 
     df = df.rename(columns={"person": "new_executive", "matched_title": "position"})
@@ -316,14 +313,18 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         "position",
         "effective_date",
         "event_type",
+
+        # Curated numeric fields
         "base_salary_usd",
         "target_bonus_pct",
         "target_bonus_usd",
         "equity_target_annual_usd_total",
         "target_total_comp_usd",
         "one_time_cash_usd_total",
-        "one_time_cash_values",
         "equity_one_time_usd_total",
+
+        # Details
+        "one_time_cash_values",
         "equity_one_time_values",
         "equity_one_time_labels",
         "equity_target_annual_values",
@@ -332,8 +333,11 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         "primary_doc_url",
         "confidence",
     ]
+
     df = df[[c for c in ordered if c in df.columns]]
     return df
+
+
 # ----------
 # UI
 # ----------
@@ -366,6 +370,14 @@ as_of_date = st.sidebar.date_input(
 )
 
 lookback_months = st.sidebar.slider("Look-back months", min_value=1, max_value=36, value=6)
+include_interim = st.sidebar.checkbox(
+    "Include interim appointments",
+    value=False,
+    help=(
+        "If unchecked, interim appointments are excluded from the Results table. "
+        "Companies where only an interim appointment was detected will be listed separately."
+    ),
+)
 max_rps = st.sidebar.slider("Max requests/sec (keep ≤ 10)", min_value=1, max_value=10, value=6)
 
 with st.sidebar.expander("Advanced"):
@@ -380,23 +392,15 @@ st.sidebar.caption(
 )
 
 st.subheader("Watchlist")
-colA, colB = st.columns([1, 1])
 
-with colA:
-    uploaded = st.file_uploader("Upload tickers file (.txt)", type=["txt"])
-with colB:
-    pasted = st.text_area(
-        "Or paste tickers (comma/space/newline separated)",
-        placeholder="MPC\nAAPL\nMSFT\n...",
-        height=140,
-    )
+pasted = st.text_area(
+    "Paste ticker symbols (comma/space/newline separated)",
+    placeholder="MPC\nFIS\nAAPL\n...",
+    height=160,
+    help="Paste tickers here. Lines starting with # are ignored.",
+)
 
 tickers: List[str] = []
-if uploaded is not None:
-    try:
-        tickers.extend(parse_tickers(uploaded.getvalue().decode("utf-8", errors="replace")))
-    except Exception:
-        st.error("Could not read uploaded file as UTF-8 text.")
 if pasted.strip():
     tickers.extend(parse_tickers(pasted))
 
@@ -447,13 +451,77 @@ if run_clicked:
 st.divider()
 
 st.subheader("Results")
-results = load_events_from_db(watchlist, position=position, lookback_months=lookback_months, as_of_date=as_of_date)
+raw_results = load_events_from_db(
+    watchlist,
+    position=position,
+    lookback_months=lookback_months,
+    as_of_date=as_of_date,
+)
 
-if results is None:
-    results = pd.DataFrame()
+# Always work with a DataFrame
+results = raw_results if isinstance(raw_results, pd.DataFrame) else pd.DataFrame()
+
+excluded_interim_lines: List[str] = []
+
+if (not include_interim) and (not results.empty):
+    # Interim detection comes from the scanner (event_type == "interim").
+    # As a fallback, also check for the word "interim" in the matched position text.
+    et = results.get("event_type")
+    pos_col = results.get("position")
+    interim_mask = pd.Series([False] * len(results), index=results.index)
+    if et is not None:
+        interim_mask = interim_mask | et.fillna("").astype(str).str.lower().eq("interim")
+    if pos_col is not None:
+        interim_mask = interim_mask | pos_col.fillna("").astype(str).str.contains(r"\binterim\b", case=False, regex=True)
+
+    interim_rows = results[interim_mask].copy()
+    non_interim_rows = results[~interim_mask].copy()
+
+    # Companies that would disappear entirely from the results when interim rows are removed.
+    interim_only = set(interim_rows.get("ticker", [])) - set(non_interim_rows.get("ticker", []))
+    interim_only_ordered = [t for t in watchlist if t in interim_only]
+
+    if interim_only_ordered and (not interim_rows.empty):
+        # Use the most recent/highest-confidence interim row per ticker for display.
+        try:
+            interim_rows = interim_rows.sort_values(["filing_date", "confidence"], ascending=[False, False])
+        except Exception:
+            pass
+
+        for t in interim_only_ordered:
+            r = interim_rows[interim_rows["ticker"] == t]
+            if r.empty:
+                continue
+            top = r.iloc[0]
+            company = str(top.get("company_name", "") or "").strip()
+            exec_name = str(top.get("new_executive", "") or "").strip()
+            filed = str(top.get("filing_date", "") or "").strip()
+            title = str(top.get("position", "") or "").strip()
+
+            label = f"{t}"
+            if company:
+                label += f" — {company}"
+            details = []
+            if exec_name:
+                details.append(f"Interim: {exec_name}")
+            if filed:
+                details.append(f"Filed {filed}")
+            if title:
+                details.append(title)
+            if details:
+                label += " (" + "; ".join(details) + ")"
+            excluded_interim_lines.append(label)
+
+    results = non_interim_rows
 
 if results.empty:
-    st.info("No matching executive appointment events found in the selected window (or none scanned yet).")
+    if (not include_interim) and excluded_interim_lines:
+        st.info(
+            "No non-interim appointment events found in the selected window. "
+            "Interim-only matches were detected but excluded (see below)."
+        )
+    else:
+        st.info("No matching executive appointment events found in the selected window (or none scanned yet).")
 else:
     st.dataframe(
         results,
@@ -462,18 +530,18 @@ else:
         column_config={
             "source_8k_url": st.column_config.LinkColumn("8‑K", display_text="Open 8‑K"),
             "primary_doc_url": st.column_config.LinkColumn("Primary doc", display_text="Open"),
-            "base_salary_usd": st.column_config.NumberColumn("Salary (USD)"),
+            "base_salary_usd": st.column_config.NumberColumn("Salary"),
             "target_bonus_pct": st.column_config.NumberColumn("Bonus target (%)"),
-            "target_bonus_usd": st.column_config.NumberColumn("Bonus target (USD)"),
-            "equity_target_annual_usd_total": st.column_config.NumberColumn("Annual/target equity (USD)"),
-            "target_total_comp_usd": st.column_config.NumberColumn("Target total comp (USD)"),
-            "one_time_cash_usd_total": st.column_config.NumberColumn("One-time cash (USD)"),
-            "equity_one_time_usd_total": st.column_config.NumberColumn("One-time equity (USD)"),
+            "target_bonus_usd": st.column_config.NumberColumn("Bonus target ($)"),
+            "equity_target_annual_usd_total": st.column_config.NumberColumn("Annual/target equity ($)"),
+            "target_total_comp_usd": st.column_config.NumberColumn("Target total comp ($)"),
+            "one_time_cash_usd_total": st.column_config.NumberColumn("One-time cash ($)"),
+            "equity_one_time_usd_total": st.column_config.NumberColumn("One-time equity ($)"),
             "confidence": st.column_config.NumberColumn("Confidence"),
         },
     )
 
-    # Download CSV
+    # Download CSV (respects interim filter)
     csv_buf = io.StringIO()
     results.to_csv(csv_buf, index=False)
     st.download_button(
@@ -481,6 +549,15 @@ else:
         data=csv_buf.getvalue().encode("utf-8"),
         file_name="events.csv",
         mime="text/csv",
+    )
+
+if (not include_interim) and excluded_interim_lines:
+    st.markdown("### Interim appointments excluded")
+    st.text_area(
+        "Companies where only an interim appointment was detected (excluded from Results)",
+        value="\n".join(excluded_interim_lines),
+        height=min(260, 80 + 18 * len(excluded_interim_lines)),
+        disabled=True,
     )
 
 st.caption(
