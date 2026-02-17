@@ -921,7 +921,6 @@ APPOINT_VERBS = [
     r"promot(?:ed|es|ion)",
     r"select(?:ed|s)?",
     r"designat(?:ed|es)?",
-    r"succ(?:eed|ession)",
     r"hire(?:d|s)?",
 ]
 
@@ -979,6 +978,8 @@ def _compile_exec_regexes(position_titles: List[str]) -> List[re.Pattern]:
     verbs_alt = "|".join(APPOINT_VERBS)
 
     patterns = [
+        # "Jane Doe will succeed John Roe as Chief Financial Officer"
+        rf"(?P<name>{NAME_RE})\s+will\s+(?:succeed|replace)\s+(?:{NAME_RE})\s+as\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "appointed John Doe as Chief Financial Officer"
         rf"\b(?P<lemma>{verbs_alt})\b\s+(?P<name>{NAME_RE})\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe was appointed as Chief Financial Officer"
@@ -1039,15 +1040,82 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
                 )
             )
 
-    # Dedupe by (name,title)
+    # Dedupe + prefer higher-specificity role titles (e.g., prefer "Chief Financial Officer" over "principal financial officer")
+    def _strip_honorific(n: str) -> str:
+        return re.sub(r"^(?:Mr\.|Ms\.|Mrs\.|Dr\.)\s+", "", (n or "").strip(), flags=re.IGNORECASE)
+
+    def _last_name_key(n: str) -> str:
+        core = re.sub(r"[^\w\s\-’']", " ", _strip_honorific(n))
+        toks = [t for t in core.split() if t]
+        return (toks[-1].lower() if toks else (n or "").lower()).strip()
+
+    def _name_token_count(n: str) -> int:
+        core = _strip_honorific(n)
+        toks = [t for t in re.findall(r"[A-Za-z][A-Za-z\.\-’']+", core)]
+        return len(toks)
+
+    def _title_score(t: str) -> int:
+        t_low = (t or "").lower()
+        score = 0
+        for i, tok in enumerate(pos_titles):
+            tok = (tok or "").strip()
+            if not tok:
+                continue
+            if len(tok) <= 4:  # likely acronym
+                if re.search(rf"\\b{re.escape(tok)}\\b", t or "", re.IGNORECASE):
+                    score = max(score, 100 - i * 10)
+            else:
+                if tok.lower() in t_low:
+                    score = max(score, 100 - i * 10)
+        # small preference for fuller titles
+        score += min(15, max(0, len((t or "").split()) - 1))
+        return score
+
+    # First pass: remove exact dupes
     seen = set()
-    deduped: List[ExecMatch] = []
+    uniq: List[ExecMatch] = []
     for mm in matches:
         k = (mm.name.lower(), mm.title.lower())
         if k in seen:
             continue
         seen.add(k)
-        deduped.append(mm)
+        uniq.append(mm)
+
+    # If we have a higher-specificity title (e.g., CFO/CEO), drop lower-specificity variants
+    high_tokens: List[str] = []
+    if pos_titles:
+        high_tokens.append(pos_titles[0])
+    if len(pos_titles) >= 2:
+        high_tokens.append(pos_titles[1])
+
+    if high_tokens:
+        hi: List[ExecMatch] = []
+        for mm in uniq:
+            tl = (mm.title or "")
+            if any(
+                (re.search(rf"\\b{re.escape(tok)}\\b", tl, re.IGNORECASE) if len(tok) <= 4 else tok.lower() in tl.lower())
+                for tok in high_tokens
+                if tok
+            ):
+                hi.append(mm)
+        if hi:
+            uniq = hi
+
+    # Group by last name (so "Mr. Graff" collapses into "Marc D. Graff" if present)
+    by_last: Dict[str, List[ExecMatch]] = {}
+    for mm in uniq:
+        by_last.setdefault(_last_name_key(mm.name), []).append(mm)
+
+    deduped: List[ExecMatch] = []
+    for _, group in by_last.items():
+        best = sorted(
+            group,
+            key=lambda x: (_title_score(x.title), _name_token_count(x.name), len(x.name)),
+            reverse=True,
+        )[0]
+        deduped.append(best)
+
+    deduped.sort(key=lambda x: _title_score(x.title), reverse=True)
 
     detected = bool(deduped)
 
@@ -1070,8 +1138,9 @@ DOLLAR_RE = r"(?:US\$|[$€£])\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?(?:million|b
 COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("base_salary", re.compile(rf"\b(annual base salary|base salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("base_salary", re.compile(rf"\b(annual salary|salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("target_bonus", re.compile(r"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity)\b[^.:\n]{0,220}?(\d{1,3}\s?%)", re.IGNORECASE)),
-    ("target_bonus", re.compile(rf"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("target_bonus", re.compile(r"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity|cash incentive bonus|annual cash incentive bonus|annual incentive bonus)\b[^.:\n]{0,220}?(\d{1,3}\s?%)", re.IGNORECASE)),
+    ("target_bonus", re.compile(r"\b(target payout|target payout of|at target)\b[^.:\n]{0,80}?(\d{1,3}\s?%)\s+of\s+(?:his|her|the)\s+base\s+salary", re.IGNORECASE)),
+    ("target_bonus", re.compile(rf"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity|cash incentive bonus|annual cash incentive bonus|annual incentive bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("sign_on_bonus", re.compile(rf"\b(sign(?:ing)?-?on bonus|one-time (?:cash )?(?:signing|sign-on) bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
 
     ("one_time_cash", re.compile(rf"\b(sign(?:ing)?(?:-?on)?\s+bonus|signing bonus|sign-?on bonus|inducement|make-?whole|make whole)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
@@ -1085,6 +1154,7 @@ COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("equity_award", re.compile(r"\b(stock option|options?)\b[^.:\n]{0,280}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares)", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(restricted stock units|RSUs|stock options?|option award)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(long-?term incentive|LTI|equity incentive|target award value|grant date value)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(equity awards?|equity award)\b[^.:\n]{{0,260}}?\b(total value|aggregate value|target delivered value|delivered value|target value)\b[^.:\n]{{0,80}}?(?:of\s+)?({DOLLAR_RE})", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(annual|target)\b[^.:\n]{{0,240}}?\b(long-?term incentive|LTI|equity)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(equity\s+grant\s+opportunity|annual\s+equity\s+grant\s+opportunity|target\s+annual\s+equity\s+grant\s+opportunity|equity\s+grant)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("equity_award", re.compile(rf"\b(inducement|make-?whole|make whole|sign(?:ing)?|new hire|initial|one-?time)\b[^.:\n]{{0,240}}?\b(award|grant|RSUs?|restricted stock|equity|stock options?)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
@@ -1131,6 +1201,7 @@ ONE_TIME_KWS = (
     "inducement",
     "make-whole",
     "make whole",
+    "replacement",
     "new hire",
     "initial",
     "commencement",
@@ -1154,12 +1225,24 @@ ANNUAL_TARGET_KWS = (
 def _extract_money_strings(s: str) -> List[str]:
     return [money_norm(x) for x in MONEY_FIND_RE.findall(s or "")]
 
+
+def _match_money_group(m: re.Match) -> Optional[str]:
+    """Return the first regex group that looks like a $-amount (avoids mixing cash+equity in one sentence)."""
+    if not m:
+        return None
+    for g in reversed(m.groups()):
+        if g and re.search(r"(?:US\$|[$€£])", g):
+            return g
+    return None
+
 def _equity_labels(s_low: str) -> List[str]:
     labels: List[str] = []
     if "inducement" in s_low:
         labels.append("inducement")
     if "make-whole" in s_low or "make whole" in s_low:
         labels.append("make-whole")
+    if "replacement" in s_low:
+        labels.append("replacement")
     if "signing" in s_low or "sign-on" in s_low or "sign on" in s_low:
         labels.append("signing")
     if "new hire" in s_low or "initial" in s_low or "commencement" in s_low:
@@ -1169,9 +1252,22 @@ def _equity_labels(s_low: str) -> List[str]:
     return _dedupe(labels)
 
 def _classify_equity_snippet(s: str) -> str:
+    """
+    Classify an equity-related sentence into:
+      - one_time: sign-on / inducement / make-whole / replacement / initial grants
+      - annual_target: annual/ongoing or target equity/LTI opportunity (default if equity is mentioned and not clearly one-time)
+      - other: not equity
+    """
     s_low = (s or "").lower()
     if not any(k in s_low for k in EQUITY_CONTEXT_KWS):
         return "other"
+
+    # Explicit one-time / make-whole language should override "target" wording.
+    if any(k in s_low for k in ONE_TIME_KWS):
+        return "one_time"
+
+    # If it's equity-related and not explicitly one-time, treat as annual/ongoing/target.
+    return "annual_target"
 
     one_time_score = 0
     annual_score = 0
@@ -1225,27 +1321,25 @@ def extract_compensation(text: str) -> ExtractedComp:
             elif field == "one_time_cash":
                 cash_snip = sentence_snippet(text, m.start(), m.end())
                 comp.one_time_cash_details.append(cash_snip)
-                comp.one_time_cash_values.extend(_extract_money_strings(cash_snip))
+                money = _match_money_group(m)
+                if money:
+                    comp.one_time_cash_values.append(money_norm(money))
 
             elif field == "equity_award":
-                comp.equity_awards.append(sentence_snippet(text, m.start(), m.end()))
+                eq_snip = sentence_snippet(text, m.start(), m.end())
+                comp.equity_awards.append(eq_snip)
+                money = _match_money_group(m)
+                if money:
+                    cat = _classify_equity_snippet(eq_snip)
+                    if cat == "one_time":
+                        comp.equity_one_time_details.append(eq_snip[:360])
+                        comp.equity_one_time_values.append(money_norm(money))
+                        comp.equity_one_time_labels.extend(_equity_labels(eq_snip.lower()))
+                    elif cat == "annual_target":
+                        comp.equity_target_annual_details.append(eq_snip[:360])
+                        comp.equity_target_annual_values.append(money_norm(money))
             elif field == "severance":
                 comp.severance.append(snippet[:360])
-
-    # Curate equity into annual/target vs one-time buckets (prefer $ values)
-    for snip in comp.equity_awards:
-        monies = _extract_money_strings(snip)
-        if not monies:
-            continue
-
-        cat = _classify_equity_snippet(snip)
-        if cat == "annual_target":
-            comp.equity_target_annual_details.append(snip[:360])
-            comp.equity_target_annual_values.extend(monies)
-        elif cat == "one_time":
-            comp.equity_one_time_details.append(snip[:360])
-            comp.equity_one_time_values.extend(monies)
-            comp.equity_one_time_labels.extend(_equity_labels(snip.lower()))
 
     for kw in (
         "relocation",
