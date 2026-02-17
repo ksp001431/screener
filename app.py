@@ -136,10 +136,9 @@ def run_scan(
 
 
 def load_events_from_db(tickers: List[str], position: str, lookback_months: int, as_of_date: dt.date) -> pd.DataFrame:
-    """
-    Load scanned events from the local SQLite DB and expand curated compensation fields from raw_json.
+    """Load scanned events from SQLite and expand curated comp fields from raw_json.
 
-    IMPORTANT: This must ALWAYS return a pandas DataFrame (possibly empty). Returning None will break the UI.
+    IMPORTANT: Always return a DataFrame (possibly empty).
     """
     if not DB_PATH.exists():
         return pd.DataFrame()
@@ -181,7 +180,6 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         finally:
             con.close()
     except Exception as e:
-        # Don't crash the app if the DB is corrupt/missing tables, etc.
         st.error(f"Failed to load results from SQLite DB: {e}")
         return pd.DataFrame()
 
@@ -203,9 +201,9 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         # Build URLs from filing fields (dataclasses.asdict doesn't include computed properties)
         source_8k_url = ""
         primary_doc_url = ""
+        accession = str(filing.get("accession") or "")
         try:
             cik = str(filing.get("cik") or "")
-            accession = str(filing.get("accession") or "")
             primary_doc = str(filing.get("primary_doc") or "")
             if cik.isdigit() and accession:
                 cik_int = int(cik)
@@ -247,6 +245,11 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         # Annual/target equity/LTI values (ongoing)
         equity_target_values = comp.get("equity_target_annual_values") or []
 
+        # Evidence snippets for traceability
+        evidence_snips = comp.get("evidence_snippets") or []
+        # Keep it readable in CSV/UI
+        evidence_text = "\n".join([str(s) for s in evidence_snips if s])
+
         # Target total comp (salary + target bonus $ + annual/ongoing equity/LTI target $)
         target_total_comp_usd = None
         try:
@@ -255,7 +258,7 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         except Exception:
             pass
 
-        # A short human-readable summary
+        # A short human-readable summary (kept for quick scanning)
         parts = []
         try:
             if base_salary_usd not in (None, ""):
@@ -273,11 +276,11 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
                 lab = f" ({', '.join(equity_one_time_labels)})" if equity_one_time_labels else ""
                 parts.append(f"One-time equity ${int(equity_one_time_usd_total):,}" + lab)
         except Exception:
-            # Don't let formatting errors break the whole table
             pass
 
         return {
-            # Key URLs
+            # IDs/links
+            "accession": accession,
             "source_8k_url": source_8k_url,
             "primary_doc_url": primary_doc_url,
 
@@ -290,13 +293,14 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
             "one_time_cash_usd_total": one_time_cash_usd_total,
             "equity_one_time_usd_total": equity_one_time_usd_total,
 
-            # Detail strings for auditability
+            # Audit/detail fields (hidden from the default table, but downloadable and visible in expanders)
             "one_time_cash_values": "; ".join([str(x) for x in one_time_cash_values if x]),
             "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
             "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
             "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
             "other_keywords": ", ".join(other),
             "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
+            "evidence_snippets": evidence_text,
         }
 
     expanded = df["raw_json"].apply(comp_fields).apply(pd.Series)
@@ -304,6 +308,7 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
 
     df = df.rename(columns={"person": "new_executive", "matched_title": "position"})
 
+    # Keep a stable ordering (full results)
     ordered = [
         "ticker",
         "company_name",
@@ -323,17 +328,18 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         "one_time_cash_usd_total",
         "equity_one_time_usd_total",
 
-        # Details
+        # Detail fields
+        "compensation_summary",
         "one_time_cash_values",
+        "equity_target_annual_values",
         "equity_one_time_values",
         "equity_one_time_labels",
-        "equity_target_annual_values",
         "other_keywords",
-        "compensation_summary",
         "primary_doc_url",
+        "accession",
         "confidence",
+        "evidence_snippets",
     ]
-
     df = df[[c for c in ordered if c in df.columns]]
     return df
 
@@ -381,10 +387,22 @@ include_interim = st.sidebar.checkbox(
 max_rps = st.sidebar.slider("Max requests/sec (keep ≤ 10)", min_value=1, max_value=10, value=6)
 
 with st.sidebar.expander("Advanced"):
-    mode = st.selectbox("Ingestion mode", ["submissions", "daily-index"], index=0,
-                        help="'submissions' is best for small watchlists; 'daily-index' scans the market-wide daily index across dates.")
-    force = st.checkbox("Refresh existing filings (force re-scan)", value=False,
-                        help="Turn on once after updating the extractor to refresh older saved results in the SQLite DB.")
+    mode = st.selectbox(
+        "Ingestion mode",
+        ["submissions", "daily-index"],
+        index=0,
+        help="'submissions' is best for small watchlists; 'daily-index' scans the market-wide daily index across dates.",
+    )
+    force = st.checkbox(
+        "Refresh existing filings (force re-scan)",
+        value=False,
+        help="Turn on once after updating the extractor to refresh older saved results in the SQLite DB.",
+    )
+    show_audit_cols = st.checkbox(
+        "Show audit columns in Results table",
+        value=False,
+        help="By default, the Results table is curated/compact. Turn this on to show all detail columns.",
+    )
 
 st.sidebar.caption(
     f"Window: {add_months(as_of_date, -int(lookback_months)).isoformat()} → {as_of_date.isoformat()}  "
@@ -404,7 +422,6 @@ tickers: List[str] = []
 if pasted.strip():
     tickers.extend(parse_tickers(pasted))
 
-# de-dupe while preserving order
 seen = set()
 watchlist = [t for t in tickers if not (t in seen or seen.add(t))]
 
@@ -412,7 +429,11 @@ st.write(f"**Tickers loaded:** {len(watchlist)}")
 if len(watchlist) > 0:
     st.write(", ".join(watchlist[:50]) + (" …" if len(watchlist) > 50 else ""))
 
-run_clicked = st.button("Run scan", type="primary", disabled=(len(watchlist) == 0 or not ua or "@" not in ua))
+run_clicked = st.button(
+    "Run scan",
+    type="primary",
+    disabled=(len(watchlist) == 0 or not ua or "@" not in ua),
+)
 
 if run_clicked:
     if not RUN_LOCK.acquire(blocking=False):
@@ -442,9 +463,7 @@ if run_clicked:
                 if err.strip():
                     st.warning("Scanner warnings:")
                     st.code(err)
-
                 st.success("Scan completed.")
-
         finally:
             RUN_LOCK.release()
 
@@ -458,14 +477,11 @@ raw_results = load_events_from_db(
     as_of_date=as_of_date,
 )
 
-# Always work with a DataFrame
 results = raw_results if isinstance(raw_results, pd.DataFrame) else pd.DataFrame()
 
 excluded_interim_lines: List[str] = []
 
 if (not include_interim) and (not results.empty):
-    # Interim detection comes from the scanner (event_type == "interim").
-    # As a fallback, also check for the word "interim" in the matched position text.
     et = results.get("event_type")
     pos_col = results.get("position")
     interim_mask = pd.Series([False] * len(results), index=results.index)
@@ -477,12 +493,10 @@ if (not include_interim) and (not results.empty):
     interim_rows = results[interim_mask].copy()
     non_interim_rows = results[~interim_mask].copy()
 
-    # Companies that would disappear entirely from the results when interim rows are removed.
     interim_only = set(interim_rows.get("ticker", [])) - set(non_interim_rows.get("ticker", []))
     interim_only_ordered = [t for t in watchlist if t in interim_only]
 
     if interim_only_ordered and (not interim_rows.empty):
-        # Use the most recent/highest-confidence interim row per ticker for display.
         try:
             interim_rows = interim_rows.sort_values(["filing_date", "confidence"], ascending=[False, False])
         except Exception:
@@ -523,8 +537,32 @@ if results.empty:
     else:
         st.info("No matching executive appointment events found in the selected window (or none scanned yet).")
 else:
+    # ----
+    # Clean display view (default)
+    # ----
+    clean_cols = [
+        "ticker",
+        "company_name",
+        "filing_date",
+        "source_8k_url",
+        "new_executive",
+        "position",
+        "effective_date",
+        "event_type",
+        "base_salary_usd",
+        "target_bonus_pct",
+        "target_bonus_usd",
+        "equity_target_annual_usd_total",
+        "target_total_comp_usd",
+        "one_time_cash_usd_total",
+        "equity_one_time_usd_total",
+        "compensation_summary",
+    ]
+
+    display_df = results if show_audit_cols else results[[c for c in clean_cols if c in results.columns]]
+
     st.dataframe(
-        results,
+        display_df,
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -541,15 +579,113 @@ else:
         },
     )
 
-    # Download CSV (respects interim filter)
-    csv_buf = io.StringIO()
-    results.to_csv(csv_buf, index=False)
-    st.download_button(
-        label="Download results as CSV",
-        data=csv_buf.getvalue().encode("utf-8"),
-        file_name="events.csv",
-        mime="text/csv",
-    )
+    # Downloads: curated + full
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        csv_buf = io.StringIO()
+        display_df.to_csv(csv_buf, index=False)
+        st.download_button(
+            label="Download curated CSV",
+            data=csv_buf.getvalue().encode("utf-8"),
+            file_name="events_curated.csv",
+            mime="text/csv",
+        )
+
+    with col2:
+        csv_buf2 = io.StringIO()
+        results.to_csv(csv_buf2, index=False)
+        st.download_button(
+            label="Download full CSV (audit fields)",
+            data=csv_buf2.getvalue().encode("utf-8"),
+            file_name="events_full.csv",
+            mime="text/csv",
+        )
+
+    # ----
+    # Traceability section (keeps the main table clean)
+    # ----
+    with st.expander("Audit & evidence (traceability)", expanded=False):
+        st.caption(
+            "This section contains the fields hidden from the default Results table (e.g., extracted value strings, labels, keywords, "
+            "and evidence snippets). Use this to quickly verify the extraction against the source filing."
+        )
+
+        # Limit expansion noise if a scan returns a lot of rows
+        max_rows = min(len(results), 50)
+        if len(results) > max_rows:
+            st.info(f"Showing audit expanders for the first {max_rows} rows.")
+
+        for _, r in results.head(max_rows).iterrows():
+            t = str(r.get("ticker", "") or "").strip()
+            filed = str(r.get("filing_date", "") or "").strip()
+            name = str(r.get("new_executive", "") or "").strip()
+            title = str(r.get("position", "") or "").strip()
+            company = str(r.get("company_name", "") or "").strip()
+
+            label = f"{t} — {filed}"
+            if name:
+                label += f" — {name}"
+            if title:
+                label += f" ({title})"
+            if company:
+                label += f" — {company}"
+
+            with st.expander(label, expanded=False):
+                # Source links
+                src = str(r.get("source_8k_url", "") or "").strip()
+                prim = str(r.get("primary_doc_url", "") or "").strip()
+                acc = str(r.get("accession", "") or "").strip()
+
+                links = []
+                if src:
+                    links.append(f"[Open 8‑K index]({src})")
+                if prim:
+                    links.append(f"[Open primary document]({prim})")
+                if links:
+                    st.markdown(" | ".join(links))
+                if acc:
+                    st.caption(f"Accession: {acc}")
+
+                # Curated summary
+                summ = str(r.get("compensation_summary", "") or "").strip()
+                if summ:
+                    st.markdown(f"**Comp summary:** {summ}")
+
+                # Detail fields (strings)
+                details = {
+                    "One-time cash values": r.get("one_time_cash_values"),
+                    "Annual/target equity values": r.get("equity_target_annual_values"),
+                    "One-time equity values": r.get("equity_one_time_values"),
+                    "One-time equity labels": r.get("equity_one_time_labels"),
+                    "Other keywords": r.get("other_keywords"),
+                }
+                for k, v in details.items():
+                    v = "" if v is None else str(v)
+                    if v and v.strip() and v.strip().lower() != "nan":
+                        st.markdown(f"**{k}:** {v}")
+
+                # Evidence snippets
+                ev = str(r.get("evidence_snippets", "") or "").strip()
+                if ev:
+                    with st.expander("Evidence snippets", expanded=False):
+                        st.text(ev)
+
+                # Confidence and metadata
+                conf = r.get("confidence")
+                evt = str(r.get("event_type", "") or "").strip()
+                eff = str(r.get("effective_date", "") or "").strip()
+                meta_parts = []
+                if evt:
+                    meta_parts.append(f"Event type: {evt}")
+                if eff:
+                    meta_parts.append(f"Effective: {eff}")
+                if conf is not None and str(conf) != "nan":
+                    try:
+                        meta_parts.append(f"Confidence: {float(conf):.2f}")
+                    except Exception:
+                        pass
+                if meta_parts:
+                    st.caption(" • ".join(meta_parts))
 
 if (not include_interim) and excluded_interim_lines:
     st.markdown("### Interim appointments excluded")
@@ -559,7 +695,3 @@ if (not include_interim) and excluded_interim_lines:
         height=min(260, 80 + 18 * len(excluded_interim_lines)),
         disabled=True,
     )
-
-st.caption(
-    "Note: This app throttles requests, but avoid running multiple instances in parallel to stay within SEC fair-access limits."
-)
