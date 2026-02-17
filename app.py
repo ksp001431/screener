@@ -568,14 +568,18 @@ else:
         column_config={
             "source_8k_url": st.column_config.LinkColumn("8‑K", display_text="Open 8‑K"),
             "primary_doc_url": st.column_config.LinkColumn("Primary doc", display_text="Open"),
-            "base_salary_usd": st.column_config.NumberColumn("Salary"),
-            "target_bonus_pct": st.column_config.NumberColumn("Bonus target (%)"),
-            "target_bonus_usd": st.column_config.NumberColumn("Bonus target ($)"),
-            "equity_target_annual_usd_total": st.column_config.NumberColumn("Annual/target equity ($)"),
-            "target_total_comp_usd": st.column_config.NumberColumn("Target total comp ($)"),
-            "one_time_cash_usd_total": st.column_config.NumberColumn("One-time cash ($)"),
-            "equity_one_time_usd_total": st.column_config.NumberColumn("One-time equity ($)"),
-            "confidence": st.column_config.NumberColumn("Confidence"),
+
+            # Currency formatting (USD assumed)
+            "base_salary_usd": st.column_config.NumberColumn("Salary", format="dollar", step=1),
+            "target_bonus_usd": st.column_config.NumberColumn("Bonus target (USD)", format="dollar", step=1),
+            "equity_target_annual_usd_total": st.column_config.NumberColumn("Annual/target equity (USD)", format="dollar", step=1),
+            "target_total_comp_usd": st.column_config.NumberColumn("Target total comp (USD)", format="dollar", step=1),
+            "one_time_cash_usd_total": st.column_config.NumberColumn("One-time cash (USD)", format="dollar", step=1),
+            "equity_one_time_usd_total": st.column_config.NumberColumn("One-time equity (USD)", format="dollar", step=1),
+
+            # Percent/score formatting
+            "target_bonus_pct": st.column_config.NumberColumn("Bonus target", format="%.0f%%", step=1),
+            "confidence": st.column_config.NumberColumn("Confidence", format="%.2f"),
         },
     )
 
