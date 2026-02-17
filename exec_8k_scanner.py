@@ -205,6 +205,9 @@ class ExecEvent:
     position_query: str
     detected: bool
     confidence: float
+    filing_category: Optional[str] = None
+    item_502_signals: Optional[Dict[str, Any]] = None
+    match_signals: Optional[Dict[str, Any]] = None
     person: Optional[str] = None
     matched_title: Optional[str] = None
     effective_date: Optional[str] = None
@@ -365,7 +368,7 @@ def money_norm(s: str) -> str:
 MONEY_PARSE_RE = re.compile(
     r"(?:US\$|\$)\s*"
     r"(?P<num>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
-    r"\s*(?P<scale>million|billion|thousand|m|bn|b|k)?",
+    r"(?:\s*(?P<scale>million|billion|thousand|m|bn|b|k)\b)?",
     re.IGNORECASE,
 )
 
@@ -961,6 +964,181 @@ class ExecMatch:
     event_type: str
     effective_date: Optional[str]
 
+
+
+# -----------------------------
+# Precision filters / gating
+# -----------------------------
+
+# Phrases/words that strongly suggest the "name" capture is NOT actually a person.
+_BAD_NAME_PHRASES = (
+    "company’s", "company's", "the company", "our company",
+    "named executive officer", "named executive officers", "executive officers",
+    "officers", "directors", "board", "committee", "compensation committee",
+    "eligible employee", "participants", "tier",
+)
+
+_BAD_NAME_TOKENS = {
+    "company", "named", "executive", "officer", "officers", "director", "directors",
+    "committee", "board", "employee", "employees", "eligible", "participant", "participants",
+    "tier", "plan", "program",
+}
+
+_HONORIFICS_RE = re.compile(r"^(?:Mr\.|Ms\.|Mrs\.|Dr\.)\s+", re.IGNORECASE)
+_SUFFIX_RE = re.compile(r"(?:,?\s+(?:Jr\.|Sr\.|II|III|IV))\s*$", re.IGNORECASE)
+
+def _clean_duplicated_name(name: str) -> str:
+    """Collapse obvious duplication like 'Ms. Buese. Ms. Buese' -> 'Ms. Buese'."""
+    s = norm_ws(name or "").strip()
+    s = re.sub(r"[\s\u00a0]+", " ", s).strip()
+    # Remove repeated 'X. X' or 'X; X'
+    m = re.match(r"^(?P<x>.+?)[\.;]\s*(?P=x)$", s, flags=re.IGNORECASE)
+    if m:
+        return m.group("x").strip()
+    return s.strip(" .;,")
+
+def _strip_honorific_and_suffix(name: str) -> str:
+    s = _HONORIFICS_RE.sub("", (name or "").strip())
+    s = _SUFFIX_RE.sub("", s).strip()
+    return s
+
+def _has_honorific(name: str) -> bool:
+    return bool(_HONORIFICS_RE.match((name or "").strip()))
+
+def _name_tokens(name: str) -> List[str]:
+    core = _strip_honorific_and_suffix(name)
+    toks = re.findall(r"[A-Za-z][A-Za-z\.-’']*", core)
+    return [t for t in toks if t]
+
+def looks_like_person_name(name: str) -> bool:
+    """Heuristic: allow 'Mr. Feinberg' but reject 'Company\'s Named Executive Officers'."""
+    s = norm_ws(name or "").strip()
+    if not s:
+        return False
+
+    low = s.lower()
+    if any(p in low for p in _BAD_NAME_PHRASES):
+        return False
+
+    toks = _name_tokens(s)
+    # Require at least 2 tokens for non-honorific names; allow honorific+last-name.
+    if _has_honorific(s):
+        if len(toks) < 1 or len(toks) > 4:
+            return False
+    else:
+        if len(toks) < 2 or len(toks) > 5:
+            return False
+
+    if any(t.lower().strip(".") in _BAD_NAME_TOKENS for t in toks):
+        return False
+
+    # Avoid names that are mostly generic words (e.g., all tokens length <= 2).
+    longish = [t for t in toks if len(t.replace(".", "")) >= 3]
+    if not longish:
+        return False
+
+    return True
+
+
+# Relationship titles that should NOT be treated as the target role itself (e.g., advisor to the CEO).
+_RELATIONSHIP_KWS = (
+    "advisor", "adviser", "assistant", "special assistant", "chief of staff",
+    "reporting to", "reports to", "reporting directly to", "reporting", "reports",
+    "office of", "counsel to", "consultant to", "liaison to",
+)
+
+_COMP_PLAN_NOISE_KWS = (
+    "tier", "eligible employee", "named executive officer", "named executive officers",
+    "annual compensation", "compensation program", "compensatory", "incentive plan",
+    "bonus opportunity", "target bonus", "lti program",
+)
+
+# Used to decide if a context actually describes an appointment/promotion versus comp-plan language.
+_APPOINT_SIGNAL_RE = re.compile(
+    r"\b("
+    r"appoint(?:ed|s)?|name(?:d|s)?|elect(?:ed|s)?|hire(?:d|s)?|join(?:ed|s)?|"
+    r"promot(?:ed|es|ion)|select(?:ed|s)?|designat(?:ed|es)?|"
+    r"will\s+serve\s+as|to\s+serve\s+as|will\s+assum(?:e|ing)|assum(?:e|ed|es)\s+the\s+role|"
+    r"will\s+become|to\s+become|will\s+succeed|succeed(?:ed|s)?|replace(?:d|s)?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+def context_has_appointment_signal(ctx: str) -> bool:
+    return bool(_APPOINT_SIGNAL_RE.search(ctx or ""))
+
+def context_is_comp_plan_noise(ctx: str) -> bool:
+    low = (ctx or "").lower()
+    return any(k in low for k in _COMP_PLAN_NOISE_KWS)
+
+def title_is_relationship_to_target(title: str, pos_titles: List[str]) -> bool:
+    """Reject 'advisor to the CEO' and similar relationship roles."""
+    t_low = (title or "").lower()
+    if not t_low:
+        return False
+
+    # If it contains relationship words AND it contains one of the target position tokens => likely not the role itself.
+    if any(k in t_low for k in _RELATIONSHIP_KWS):
+        if any((tok.lower() in t_low) for tok in (pos_titles or []) if tok):
+            return True
+
+    # Also catch explicit 'to the CEO' / 'to the Chief Financial Officer' style phrases.
+    for tok in (pos_titles or []):
+        tok_low = (tok or "").strip().lower()
+        if not tok_low:
+            continue
+        if re.search(rf"\b(?:to|of|for|under)\s+(?:the\s+)?{re.escape(tok_low)}\b", t_low):
+            return True
+
+    return False
+
+def title_is_comp_plan_noise(title: str) -> bool:
+    t_low = (title or "").lower()
+    return any(k in t_low for k in _COMP_PLAN_NOISE_KWS)
+
+def detect_item_502_signals(item_text: str) -> Dict[str, Any]:
+    """Best-effort extraction of Item 5.02 sub-item signals (c/d = appointment/election, e = comp)."""
+    txt = item_text or ""
+    low = txt.lower()
+    subitems = sorted({s.lower() for s in re.findall(r"\b5\.02\s*\(([a-e])\)\b", txt, flags=re.IGNORECASE)})
+
+    has_appt_heading = bool(re.search(r"Appointment\s+of\s+Certain\s+Officers", txt, re.IGNORECASE))
+    has_depart_heading = bool(re.search(r"Departure\s+of\s+Directors\s+or\s+Certain\s+Officers", txt, re.IGNORECASE))
+    has_elect_heading = bool(re.search(r"Election\s+of\s+Directors", txt, re.IGNORECASE))
+    has_comp_heading = bool(re.search(r"Compensatory\s+Arrangements\s+of\s+Certain\s+Officers", txt, re.IGNORECASE))
+
+    has_appt_verbs = bool(_APPOINT_SIGNAL_RE.search(txt))
+    has_comp_terms = any(k in low for k in _COMP_PLAN_NOISE_KWS)
+    has_depart_terms = bool(re.search(r"\b(resign(?:ed|ation)?|retir(?:e|ed|ement)|terminate(?:d|ion)?|ceased|step(?:s)?\s+down|departure)\b", txt, re.IGNORECASE))
+
+    return {
+        "subitems": subitems,
+        "has_appt_heading": has_appt_heading,
+        "has_depart_heading": has_depart_heading,
+        "has_elect_heading": has_elect_heading,
+        "has_comp_heading": has_comp_heading,
+        "has_appt_verbs": has_appt_verbs,
+        "has_depart_terms": has_depart_terms,
+        "has_comp_terms": has_comp_terms,
+    }
+
+def classify_item_502(signals: Dict[str, Any]) -> str:
+    """Return: appointment | departure | comp_only | mixed | unknown."""
+    s = signals or {}
+    has_appt = bool(s.get("has_appt_verbs") or s.get("has_appt_heading") or ("c" in (s.get("subitems") or [])) or ("d" in (s.get("subitems") or [])))
+    has_depart = bool(s.get("has_depart_terms") or s.get("has_depart_heading") or ("b" in (s.get("subitems") or [])))
+    has_comp = bool(s.get("has_comp_terms") or s.get("has_comp_heading") or ("e" in (s.get("subitems") or [])))
+
+    if has_appt and (has_comp or has_depart):
+        return "mixed"
+    if has_appt:
+        return "appointment"
+    if has_depart:
+        return "departure"
+    if has_comp:
+        return "comp_only"
+    return "unknown"
+
 def _compile_exec_regexes(position_titles: List[str]) -> List[re.Pattern]:
     """
     Build regexes that try to catch common appointment language in Item 5.02.
@@ -992,24 +1170,35 @@ def _compile_exec_regexes(position_titles: List[str]) -> List[re.Pattern]:
         rf"(?P<name>{NAME_RE})\s+will\s+assum(?:e|ing)\s+(?:the\s+)?(?:role\s+of\s+)?{title_re}",
     ]
     return [re.compile(p, flags=re.IGNORECASE) for p in patterns]
-def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str, Any], List[ExecMatch]]:
+def detect_exec_matches(
+    text: str,
+    position_query: str,
+    strict: bool = True,
+) -> Tuple[bool, Dict[str, Any], List[ExecMatch]]:
     """
     Detect matches for the requested position in Item 5.02 context.
-    Returns:
-      detected_bool, details_dict, list_of_matches
+
+    In strict mode, apply additional filters to reduce false positives:
+      - Reject non-person "names" (e.g., "Company's Named Executive Officers")
+      - Reject relationship titles (e.g., "advisor to the CEO", "reporting to the CFO")
+      - Require an appointment/promotion signal in the local context
+      - Down-rank / optionally drop comp-plan-only Item 5.02(e) language
     """
     canonical_pos, pos_titles = build_position_patterns(position_query)
 
-    full_text = text
+    full_text = text or ""
     item_text = slice_item_502(full_text)
     has_item_502 = bool(re.search(r"\bItem\s+5\.02\b", full_text, re.IGNORECASE))
 
+    item_502_signals = detect_item_502_signals(item_text)
+    filing_category = classify_item_502(item_502_signals)
+
     regexes = _compile_exec_regexes(pos_titles)
-    matches: List[ExecMatch] = []
+    raw_matches: List[ExecMatch] = []
 
     for rx in regexes:
         for m in rx.finditer(item_text):
-            name = norm_ws(m.group("name"))
+            name = _clean_duplicated_name(norm_ws(m.group("name")))
             title = norm_ws(m.group("title"))
 
             ctx = norm_ws(item_text[max(0, m.start()-260): m.end()+260])
@@ -1021,15 +1210,16 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
             if eff_m:
                 eff = parse_date(eff_m.group("date"))
 
-            et = "unknown"
+            # event type classification (coarse)
+            et = "appointment"
             if is_interim:
                 et = "interim"
             elif re.search(r"\bpromot(?:ed|ion)\b", ctx, re.IGNORECASE):
                 et = "promotion"
-            elif re.search(r"\b(hire(?:d)?|join(?:ed|ing))\b", ctx, re.IGNORECASE):
+            elif re.search(r"\b(hire(?:d)?|join(?:ed|ing)|recruit(?:ed|ing))\b", ctx, re.IGNORECASE):
                 et = "hire"
 
-            matches.append(
+            raw_matches.append(
                 ExecMatch(
                     name=name,
                     title=title,
@@ -1040,18 +1230,60 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
                 )
             )
 
-    # Dedupe + prefer higher-specificity role titles (e.g., prefer "Chief Financial Officer" over "principal financial officer")
+    # ----
+    # Strict post-filters (kill common false positives)
+    # ----
+    filtered: List[ExecMatch] = []
+    rejected = {"non_person": 0, "relationship_title": 0, "comp_noise": 0, "no_appt_signal": 0}
+
+    for mm in raw_matches:
+        name = _clean_duplicated_name(mm.name)
+
+        if strict and not looks_like_person_name(name):
+            rejected["non_person"] += 1
+            continue
+
+        if strict and (title_is_relationship_to_target(mm.title, pos_titles) or title_is_comp_plan_noise(mm.title)):
+            rejected["relationship_title"] += 1
+            continue
+
+        if strict and context_is_comp_plan_noise(mm.context) and not context_has_appointment_signal(mm.context):
+            rejected["comp_noise"] += 1
+            continue
+
+        if strict and not context_has_appointment_signal(mm.context):
+            rejected["no_appt_signal"] += 1
+            continue
+
+        filtered.append(
+            ExecMatch(
+                name=name,
+                title=mm.title,
+                context=mm.context,
+                is_interim=mm.is_interim,
+                event_type=mm.event_type,
+                effective_date=mm.effective_date,
+            )
+        )
+
+    # If this Item 5.02 looks like comp-only and we are in strict mode, don't emit matches.
+    if strict and filing_category == "comp_only":
+        filtered = []
+
+    # ----
+    # Dedupe: prefer higher-specificity titles and fuller names
+    # ----
     def _strip_honorific(n: str) -> str:
         return re.sub(r"^(?:Mr\.|Ms\.|Mrs\.|Dr\.)\s+", "", (n or "").strip(), flags=re.IGNORECASE)
 
     def _last_name_key(n: str) -> str:
-        core = re.sub(r"[^\w\s\-’']", " ", _strip_honorific(n))
+        core = re.sub(r"[^\w\s\-\u2019']", " ", _strip_honorific(n))
         toks = [t for t in core.split() if t]
         return (toks[-1].lower() if toks else (n or "").lower()).strip()
 
     def _name_token_count(n: str) -> int:
         core = _strip_honorific(n)
-        toks = [t for t in re.findall(r"[A-Za-z][A-Za-z\.\-’']+", core)]
+        toks = [t for t in re.findall(r"[A-Za-z][A-Za-z\.-\u2019']+", core)]
         return len(toks)
 
     def _title_score(t: str) -> int:
@@ -1062,46 +1294,26 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
             if not tok:
                 continue
             if len(tok) <= 4:  # likely acronym
-                if re.search(rf"\\b{re.escape(tok)}\\b", t or "", re.IGNORECASE):
+                if re.search(rf"\b{re.escape(tok)}\b", t or "", re.IGNORECASE):
                     score = max(score, 100 - i * 10)
             else:
                 if tok.lower() in t_low:
                     score = max(score, 100 - i * 10)
-        # small preference for fuller titles
+        # preference for fuller titles
         score += min(15, max(0, len((t or "").split()) - 1))
         return score
 
-    # First pass: remove exact dupes
+    # Remove exact dupes first
     seen = set()
     uniq: List[ExecMatch] = []
-    for mm in matches:
+    for mm in filtered:
         k = (mm.name.lower(), mm.title.lower())
         if k in seen:
             continue
         seen.add(k)
         uniq.append(mm)
 
-    # If we have a higher-specificity title (e.g., CFO/CEO), drop lower-specificity variants
-    high_tokens: List[str] = []
-    if pos_titles:
-        high_tokens.append(pos_titles[0])
-    if len(pos_titles) >= 2:
-        high_tokens.append(pos_titles[1])
-
-    if high_tokens:
-        hi: List[ExecMatch] = []
-        for mm in uniq:
-            tl = (mm.title or "")
-            if any(
-                (re.search(rf"\\b{re.escape(tok)}\\b", tl, re.IGNORECASE) if len(tok) <= 4 else tok.lower() in tl.lower())
-                for tok in high_tokens
-                if tok
-            ):
-                hi.append(mm)
-        if hi:
-            uniq = hi
-
-    # Group by last name (so "Mr. Graff" collapses into "Marc D. Graff" if present)
+    # Group by last name and pick best
     by_last: Dict[str, List[ExecMatch]] = {}
     for mm in uniq:
         by_last.setdefault(_last_name_key(mm.name), []).append(mm)
@@ -1117,24 +1329,27 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
 
     deduped.sort(key=lambda x: _title_score(x.title), reverse=True)
 
-    detected = bool(deduped)
-
     details: Dict[str, Any] = {
         "canonical_position": canonical_pos,
         "has_item_502": has_item_502,
         "match_count": len(deduped),
+        "filing_category": filing_category,
+        "item_502_signals": item_502_signals,
+        "rejected_counts": rejected,
+        "strict": strict,
     }
     if deduped:
         details["examples"] = [dataclasses.asdict(deduped[0])]
 
-    return detected, details, deduped
+    return bool(deduped), details, deduped
+
 
 
 # -----------------------------
 # Compensation extraction (heuristic)
 # -----------------------------
 
-DOLLAR_RE = r"(?:US\$|[$€£])\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?(?:million|billion|thousand|m|bn|b|k))?"
+DOLLAR_RE = r"(?:US\$|[$€£])\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?(?:million|billion|thousand|bn|m|b|k)\b)?"
 COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("base_salary", re.compile(rf"\b(annual base salary|base salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("base_salary", re.compile(rf"\b(annual salary|salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
@@ -1259,44 +1474,41 @@ def _classify_equity_snippet(s: str) -> str:
       - other: not equity
     """
     s_low = (s or "").lower()
+
     if not any(k in s_low for k in EQUITY_CONTEXT_KWS):
         return "other"
-
-    # Explicit one-time / make-whole language should override "target" wording.
-    if any(k in s_low for k in ONE_TIME_KWS):
-        return "one_time"
-
-    # If it's equity-related and not explicitly one-time, treat as annual/ongoing/target.
-    return "annual_target"
 
     one_time_score = 0
     annual_score = 0
 
+    # Strong one-time signals
     if any(k in s_low for k in ONE_TIME_KWS):
         one_time_score += 3
     if "grant date value" in s_low:
         one_time_score += 2
+    if re.search(r"\b(inducement|make[- ]whole|replacement|signing|sign[- ]on|new hire|initial|commencement)\b", s_low):
+        one_time_score += 1
 
+    # Strong annual / target signals
     if any(k in s_low for k in ANNUAL_TARGET_KWS):
         annual_score += 3
-    # light signals
+    if "annual" in s_low:
+        annual_score += 1
     if "target" in s_low:
         annual_score += 1
-    if re.search(r"\b20\d{2}\b", s_low):
+    if re.search(r"\b(each\s+year|per\s+year|yearly)\b", s_low):
         annual_score += 1
 
+    # Decide
     if one_time_score > annual_score and one_time_score >= 2:
         return "one_time"
     if annual_score >= 2:
         return "annual_target"
 
     # Tie-breakers
-    if any(k in s_low for k in ("one-time", "one time", "inducement", "make-whole", "make whole", "signing", "new hire", "initial")):
+    if any(k in s_low for k in ONE_TIME_KWS):
         return "one_time"
-    if "annual" in s_low or "target" in s_low:
-        return "annual_target"
-
-    return "other"
+    return "annual_target"
 
 
 def extract_compensation(text: str) -> ExtractedComp:
@@ -1459,6 +1671,87 @@ def build_summary(event: ExecEvent) -> str:
 # Orchestration
 # -----------------------------
 
+def _build_name_variants_for_search(name: str) -> List[str]:
+    """Return a small set of name variants to find relevant snippets in exhibits."""
+    s = _clean_duplicated_name(name or "")
+    core = _strip_honorific_and_suffix(s)
+    toks = _name_tokens(s)
+    last = toks[-1] if toks else ""
+    variants: List[str] = []
+    if core:
+        variants.append(core)
+    if s and s not in variants:
+        variants.append(s)
+    if last:
+        for h in ("Mr.", "Ms.", "Mrs.", "Dr."):
+            variants.append(f"{h} {last}")
+    # De-dupe while preserving order; remove very short variants
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in variants:
+        v2 = norm_ws(v).strip()
+        if len(v2) < 4:
+            continue
+        k = v2.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(v2)
+    return out
+
+
+def build_focus_text_for_match(
+    match: ExecMatch,
+    text_sources: List[Tuple[str, str]],
+    max_total_snips: int = 16,
+    per_source_snips: int = 4,
+) -> str:
+    """Build a tighter text blob around a specific executive to reduce comp 'contamination'."""
+    parts: List[str] = []
+    if match.context:
+        parts.append(match.context)
+
+    variants = _build_name_variants_for_search(match.name)
+
+    for _, txt in text_sources:
+        if not txt:
+            continue
+        snips_this = 0
+        for v in variants:
+            # Case-insensitive substring search
+            for m in re.finditer(re.escape(v), txt, flags=re.IGNORECASE):
+                parts.append(sentence_snippet(txt, m.start(), m.end(), max_len=520))
+                snips_this += 1
+                if snips_this >= per_source_snips:
+                    break
+            if snips_this >= per_source_snips:
+                break
+        if len(parts) >= max_total_snips:
+            break
+
+    # If we still have very little, fall back to including the whole Item 5.02 slice for the primary doc.
+    if len(parts) < 3:
+        for label, txt in text_sources:
+            if label == "primary":
+                parts.append(slice_item_502(txt))
+                break
+
+    # De-dupe while preserving order
+    seen: Set[str] = set()
+    out_parts: List[str] = []
+    for p in parts:
+        p2 = norm_ws(p).strip()
+        if not p2:
+            continue
+        k = p2.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out_parts.append(p2)
+
+    return "\n\n".join(out_parts).strip()
+
+
 def process_filing(
     client: SecEdgarClient,
     store: Store,
@@ -1466,6 +1759,7 @@ def process_filing(
     position_query: str,
     max_exhibits: int = 8,
     force: bool = False,
+    strict: bool = True,
 ) -> List[ExecEvent]:
     if (not force) and store.already_processed(filing.accession, position_query):
         return []
@@ -1474,10 +1768,10 @@ def process_filing(
     filing2 = pick_primary_doc(filing, docs)
 
     primary_text = fetch_text_for_doc(client, filing2.primary_url())
-    detected, _, matches = detect_exec_matches(primary_text, position_query=position_query)
+    detected, details, matches = detect_exec_matches(primary_text, position_query=position_query, strict=strict)
 
     # Candidate exhibits likely to contain comp terms
-    comp_text_blobs: List[str] = [primary_text]
+    text_sources: List[Tuple[str, str]] = [("primary", primary_text)]
     likely_docs: List[FilingDocument] = []
     for d in docs:
         fn = (d.filename or "").lower()
@@ -1494,41 +1788,70 @@ def process_filing(
 
     for d in likely_docs[:max_exhibits]:
         try:
-            comp_text_blobs.append(fetch_text_for_doc(client, d.url))
+            txt = fetch_text_for_doc(client, d.url)
         except requests.HTTPError:
             continue
+        if txt:
+            # Prefer filename if present; fall back to URL
+            label = (d.filename or "").strip() or d.url
+            text_sources.append((label, txt))
 
-    combined_text = "\n\n".join([t for t in comp_text_blobs if t])
+    combined_text = "\n\n".join([t for _, t in text_sources if t])
 
     # If no match from the primary doc, try combined (primary + exhibits)
-    if not matches and combined_text:
-        detected2, _, matches2 = detect_exec_matches(combined_text, position_query=position_query)
+    if (not matches) and combined_text:
+        detected2, details2, matches2 = detect_exec_matches(combined_text, position_query=position_query, strict=strict)
         if detected2:
-            matches = matches2
-            detected = True
+            detected, details, matches = detected2, details2, matches2
 
     if not detected or not matches:
         store.mark_processed(filing2, position_query)
         return []
 
+    filing_category = (details or {}).get("filing_category")
+    item_502_signals = (details or {}).get("item_502_signals")
+
+    # Hard-stop: comp-only Item 5.02(e) (common false positive case)
+    if strict and filing_category == "comp_only":
+        store.mark_processed(filing2, position_query)
+        return []
+
     # Confidence (simple, interpretable)
-    confidence = 0.55
-    if re.search(r"\bItem\s+5\.02\b", combined_text, re.IGNORECASE):
+    confidence = 0.50
+    if (details or {}).get("has_item_502"):
         confidence += 0.15
+    if filing_category in ("appointment", "mixed"):
+        confidence += 0.10
     confidence += min(0.20, 0.05 * len(matches))
     confidence = min(1.0, confidence)
 
-    comp = extract_compensation(combined_text) if combined_text else ExtractedComp()
+    # Position tokens for match_signals
+    _, pos_titles = build_position_patterns(position_query)
 
     events: List[ExecEvent] = []
     for mm in matches[:3]:  # cap for sanity
         event_id = safe_event_id(filing2.accession, position_query, mm.name, mm.title)
+
+        focus_text = build_focus_text_for_match(mm, text_sources=text_sources)
+        comp = extract_compensation(focus_text) if focus_text else ExtractedComp()
+
+        match_signals = {
+            "context_has_appointment_signal": context_has_appointment_signal(mm.context),
+            "context_is_comp_plan_noise": context_is_comp_plan_noise(mm.context),
+            "title_is_relationship_to_target": title_is_relationship_to_target(mm.title, pos_titles),
+            "title_is_comp_plan_noise": title_is_comp_plan_noise(mm.title),
+            "strict": strict,
+        }
+
         evt = ExecEvent(
             event_id=event_id,
             filing=filing2,
             position_query=position_query,
             detected=True,
             confidence=confidence,
+            filing_category=filing_category,
+            item_502_signals=item_502_signals,
+            match_signals=match_signals,
             person=mm.name,
             matched_title=mm.title,
             effective_date=mm.effective_date,
@@ -1686,6 +2009,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     scan.add_argument("--mode", choices=["submissions", "daily-index"], default="submissions",
                       help="Ingestion mode. 'submissions' is efficient for small watchlists; 'daily-index' scans the daily master index across dates.")
     scan.add_argument("--force", action="store_true", help="Re-scan filings even if already processed (refresh extraction).")
+    scan.add_argument("--relaxed", action="store_true", help="Relax match filters (more false positives; useful for debugging).")
     scan.add_argument("--out-jsonl", default="events.jsonl")
     scan.add_argument("--out-csv", default="events.csv")
     scan.add_argument("--out-md", default="events.md")
@@ -1770,6 +2094,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         filing=filing,
                         position_query=args.position,
                         force=bool(args.force),
+                        strict=(not bool(args.relaxed)),
                     )
                     all_events.extend(events)
                 except requests.HTTPError as e:
@@ -1820,6 +2145,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     filing=filing,
                     position_query=args.position,
                     force=bool(args.force),
+                    strict=(not bool(args.relaxed)),
                 )
                 all_events.extend(events)
             except requests.HTTPError as e:
