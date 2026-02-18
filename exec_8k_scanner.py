@@ -1503,23 +1503,53 @@ def _equity_labels(s_low: str) -> List[str]:
 
 
 def _infer_award_type(s_low: str) -> str:
-    # Prefer explicit security types for de-dupe (important when two awards share same $ value).
-    if "psu" in s_low or "performance share" in s_low:
+    """Infer an equity award subtype for labeling + de-dupe.
+
+    Key goal: preserve legitimate same-$ distinct awards (e.g., RSU + PBRSU with the same value).
+    """
+    s_low = (s_low or "").lower()
+
+    # PSUs / performance share units (explicit PSU terminology wins)
+    if re.search(r"\bpsus?\b", s_low) or "performance stock unit" in s_low or "performance share" in s_low:
         return "psu"
-    if "rsu" in s_low or "restricted stock unit" in s_low:
+
+    # Performance-based RSU variants (PBRSU / performance-based restricted stock units)
+    if (
+        re.search(r"\bpbrsus?\b", s_low)
+        or "performance-based restricted stock unit" in s_low
+        or "performance based restricted stock unit" in s_low
+        or "performance-vesting restricted stock unit" in s_low
+        or "performance vesting restricted stock unit" in s_low
+        or "performance-based restricted stock units" in s_low
+        or "performance based restricted stock units" in s_low
+        or "performance-vesting restricted stock units" in s_low
+        or "performance vesting restricted stock units" in s_low
+    ):
+        return "pbrsu"
+
+    # Time-based RSUs
+    if re.search(r"\brsus?\b", s_low) or "restricted stock unit" in s_low:
         return "rsu"
+
     if "option" in s_low:
         return "option"
+
+    # Avoid misclassifying "restricted stock units" as "restricted stock"
     if "restricted stock" in s_low:
         return "restricted_stock"
+
     return "equity"
 
 
 # Award type helpers for multi-award clauses (prevents "RSUs and PSUs ... $X and $Y, respectively"
 # from collapsing into a single award type).
 _AWARD_TYPE_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    # PBRSU / performance-vesting RSU variants
+    ("pbrsu", re.compile(r"\bpbrsus?\b|performance[-\s]?based restricted stock units?|performance[-\s]?vesting restricted stock units?", re.IGNORECASE)),
+    # Time-based RSUs
     ("rsu", re.compile(r"\brsus?\b|restricted stock units?", re.IGNORECASE)),
-    ("psu", re.compile(r"\bpsus?\b|performance-vesting restricted stock units?|performance-based restricted stock units?|performance share", re.IGNORECASE)),
+    # PSUs / performance share units
+    ("psu", re.compile(r"\bpsus?\b|performance stock units?|performance share units?|performance share", re.IGNORECASE)),
     ("option", re.compile(r"\bstock options?\b|\boptions?\b", re.IGNORECASE)),
     ("restricted_stock", re.compile(r"\brestricted stock\b(?!\s+units?)", re.IGNORECASE)),
 ]
@@ -1711,7 +1741,7 @@ def extract_compensation(text: str) -> ExtractedComp:
         seen_keys.add(key)
 
         disp = amt_str
-        if award_type in ("rsu", "psu", "option", "restricted_stock") and amt_str:
+        if award_type in ("rsu", "psu", "pbrsu", "option", "restricted_stock") and amt_str:
             disp = f"{amt_str} ({award_type.upper()})"
 
         if bucket == "annual_target":
