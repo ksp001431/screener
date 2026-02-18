@@ -23,7 +23,7 @@ st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
 CACHE_DIR = Path(".cache_edgar")
-SCANNER = Path("exec_8k_scanner.py")
+SCANNER = Path("exec_8k_scanner_v4.py")
 
 
 # ----------
@@ -236,7 +236,7 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         if one_time_cash_usd_total in (None, ""):
             one_time_cash_usd_total = comp.get("sign_on_bonus_usd")
 
-        one_time_cash_values = comp.get("one_time_cash_values") or []
+        one_time_cash_values = comp.get("one_time_cash") or []
         if (not one_time_cash_values) and comp.get("sign_on_bonus"):
             one_time_cash_values = [comp.get("sign_on_bonus")]
 
@@ -247,6 +247,9 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
 
         # Annual/target equity/LTI values (ongoing)
         equity_target_values = comp.get("equity_target_annual_values") or []
+        equity_target_pct_values = comp.get("equity_target_annual_pct_values") or []
+        equity_target_counts = comp.get("equity_target_annual_counts") or []
+        equity_one_time_counts = comp.get("equity_one_time_counts") or []
 
         # Evidence snippets for traceability
         evidence_snips = comp.get("evidence_snippets") or []
@@ -306,6 +309,9 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
             "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
             "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
             "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
+            "equity_target_annual_pct_values": "; ".join([f"{float(x):g}%" for x in equity_target_pct_values if x is not None]),
+            "equity_target_annual_counts": "; ".join([str(x) for x in equity_target_counts if x]),
+            "equity_one_time_counts": "; ".join([str(x) for x in equity_one_time_counts if x]),
             "other_keywords": ", ".join(other),
             "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
             "evidence_snippets": evidence_text,
@@ -340,6 +346,9 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         "compensation_summary",
         "one_time_cash_values",
         "equity_target_annual_values",
+        "equity_target_annual_pct_values",
+        "equity_target_annual_counts",
+        "equity_one_time_counts",
         "equity_one_time_values",
         "equity_one_time_labels",
         "other_keywords",

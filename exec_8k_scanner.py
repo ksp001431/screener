@@ -186,6 +186,14 @@ class ExtractedComp:
     equity_target_annual_values: List[str] = dataclasses.field(default_factory=list)
     equity_target_annual_details: List[str] = dataclasses.field(default_factory=list)
 
+    # Equity targets expressed as % of base salary (common in 8-K offer letters / employment agreements)
+    equity_target_annual_pct_values: List[float] = dataclasses.field(default_factory=list)
+    equity_target_annual_pct_details: List[str] = dataclasses.field(default_factory=list)
+
+    # Equity award counts (shares/units/options) when no $ value is disclosed
+    equity_target_annual_counts: List[str] = dataclasses.field(default_factory=list)
+    equity_one_time_counts: List[str] = dataclasses.field(default_factory=list)
+
     equity_one_time_values: List[str] = dataclasses.field(default_factory=list)
     equity_one_time_labels: List[str] = dataclasses.field(default_factory=list)
     equity_one_time_details: List[str] = dataclasses.field(default_factory=list)
@@ -366,7 +374,7 @@ def money_norm(s: str) -> str:
     return norm_ws(s).replace("\u00a0", " ")
 
 MONEY_PARSE_RE = re.compile(
-    r"(?:US\$|\$)\s*"
+    r"(?:US\$|U\.S\.\$|USD\s*\$?|\$)\s*"
     r"(?P<num>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
     r"(?:\s*(?P<scale>million|billion|thousand|m|bn|b|k)\b)?",
     re.IGNORECASE,
@@ -1349,35 +1357,39 @@ def detect_exec_matches(
 # Compensation extraction (heuristic)
 # -----------------------------
 
-DOLLAR_RE = r"(?:US\$|[$€£])\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?(?:million|billion|thousand|bn|m|b|k)\b)?"
+DOLLAR_RE = r"(?:US\$|U\.S\.\$|USD\s*\$?|[$€£])\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?(?:million|billion|thousand|bn|m|b|k)\b)?"
+
 COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
-    ("base_salary", re.compile(rf"\b(annual base salary|base salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("base_salary", re.compile(rf"\b(annual salary|salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("target_bonus", re.compile(r"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity|cash incentive bonus|annual cash incentive bonus|annual incentive bonus)\b[^.:\n]{0,220}?(\d{1,3}\s?%)", re.IGNORECASE)),
-    ("target_bonus", re.compile(r"\b(target payout|target payout of|at target)\b[^.:\n]{0,80}?(\d{1,3}\s?%)\s+of\s+(?:his|her|the)\s+base\s+salary", re.IGNORECASE)),
-    ("target_bonus", re.compile(rf"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity|cash incentive bonus|annual cash incentive bonus|annual incentive bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("sign_on_bonus", re.compile(rf"\b(sign(?:ing)?-?on bonus|one-time (?:cash )?(?:signing|sign-on) bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
+    # Base salary
+    ("base_salary", re.compile(rf"\b(annualized base salary|annual base salary|base salary|base pay)\b[^.\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("base_salary", re.compile(rf"({DOLLAR_RE})[^.\n]{{0,80}}?\b(annualized base salary|annual base salary|base salary|base pay)\b", re.IGNORECASE)),
 
-    ("one_time_cash", re.compile(rf"\b(sign(?:ing)?(?:-?on)?\s+bonus|signing bonus|sign-?on bonus|inducement|make-?whole|make whole)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("one_time_cash", re.compile(rf"({DOLLAR_RE})[^.:\n]{{0,80}}?\b(sign(?:ing)?(?:-?on)?\s+bonus|signing bonus|sign-?on bonus|inducement|make-?whole|make whole)\b", re.IGNORECASE)),  # money-before-label
+    # Target bonus / annual incentive (percent or $)
+    ("target_bonus", re.compile(rf"\b(target short-?term incentive(?: plan)?(?: opportunity)?|short-?term incentive(?: plan)?(?: opportunity)?|sti(?: opportunity)?|annual (?:cash )?incentive(?: plan)?(?: opportunity)?|cash incentive opportunity|annual incentive(?: plan)?(?: opportunity)?|bonus(?: opportunity)?|annual bonus(?: opportunity)?)\b[^.\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("target_bonus", re.compile(r"\b(target award|target opportunity)\b[^.\n]{0,220}?\b(?:annual management incentive program|management incentive program|annual incentive plan|incentive program|incentive plan|bonus plan)\b[^.\n]{0,220}?\b(?:equal to|of|at)\b[^.\n]{0,60}?(\d{1,3}(?:\.\d+)?\s?%)\s+of\s+(?:his|her|the)?\s*base\s+salary", re.IGNORECASE)),
+    ("target_bonus", re.compile(r"\b(annual (?:cash )?incentive(?: plan)?(?: opportunity)?|cash incentive opportunity|annual incentive(?: plan)?(?: opportunity)?|bonus(?: opportunity)?|annual bonus(?: opportunity)?)\b[^.\n]{0,180}?\bat\s+(?:a\s+)?target(?:\s+of)?\s+(\d{1,3}(?:\.\d+)?\s?%)\s+of\s+(?:his|her|the)?\s*base\s+salary", re.IGNORECASE)),
+    ("target_bonus", re.compile(r"\b(target (?:annual )?bonus|annual bonus target|target cash bonus|bonus opportunity|cash incentive bonus|annual cash incentive bonus|annual incentive bonus)\b[^.\n]{0,220}?(\d{1,3}(?:\.\d+)?\s?%)", re.IGNORECASE)),
+    ("target_bonus", re.compile(r"\b(target payout|target payout of|at target)\b[^.\n]{0,80}?(\d{1,3}(?:\.\d+)?\s?%)\s+of\s+(?:his|her|the)\s+base\s+salary", re.IGNORECASE)),
 
-    ("one_time_cash", re.compile(rf"\b(one-?time|one time)\b[^.:\n]{{0,80}}?\b(?:cash\s+)?(?:bonus|payment)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("one_time_cash", re.compile(rf"\blump sum payment\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
+    # Sign-on / inducement cash bonus (explicit)
+    ("sign_on_bonus", re.compile(rf"\b(sign(?:ing|ing-on)?|sign-on|inducement|make-?whole|make whole)\s+bonus\b[^.\n]{{0,200}}?({DOLLAR_RE})", re.IGNORECASE)),
 
-    # Equity / LTI - shares/units or $ value
-    ("equity_award", re.compile(r"\b(restricted stock units|RSUs)\b[^.:\n]{0,260}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares|units)", re.IGNORECASE)),
-    ("equity_award", re.compile(r"\b(stock option|options?)\b[^.:\n]{0,280}?\b(\d{1,3}(?:,\d{3})*)\b\s+(?:shares)", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(restricted stock units|RSUs|stock options?|option award)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(long-?term incentive|LTI|equity incentive|target award value|grant date value)\b[^.:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(equity awards?|equity award)\b[^.:\n]{{0,260}}?\b(total value|aggregate value|target delivered value|delivered value|target value)\b[^.:\n]{{0,80}}?(?:of\s+)?({DOLLAR_RE})", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(annual|target)\b[^.:\n]{{0,240}}?\b(long-?term incentive|LTI|equity)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(equity\s+grant\s+opportunity|annual\s+equity\s+grant\s+opportunity|target\s+annual\s+equity\s+grant\s+opportunity|equity\s+grant)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
-    ("equity_award", re.compile(rf"\b(inducement|make-?whole|make whole|sign(?:ing)?|new hire|initial|one-?time)\b[^.:\n]{{0,240}}?\b(award|grant|RSUs?|restricted stock|equity|stock options?)\b[^.:\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
+    # Other one-time cash amounts often disclosed with hires (relocation, legal fee reimbursement, etc.)
+    ("one_time_cash", re.compile(rf"\b(one-?time|inducement|make-?whole|make whole|sign(?:ing)?|sign-on|relocation|moving|reimbursement|reimburse|legal fees|tax gross-?up)\b[^.\n]{{0,240}}?({DOLLAR_RE})", re.IGNORECASE)),
 
-    # Severance / CIC
-    ("severance", re.compile(r"\bseverance\b[^.:\n]{0,320}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE)),
-    ("severance", re.compile(r"\bchange in control\b[^.:\n]{0,340}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE)),
-    ("severance", re.compile(r"\bseverance\b[^.:\n]{0,340}?\b(\d(?:\.\d)?)\s?x\b", re.IGNORECASE)),
+    # Equity (annual targets and/or one-time awards)
+    ("equity_award", re.compile(rf"\b(equity awards?|equity award|annual equity awards?|annual equity award|annual equity grant)\b[^.\n]{{0,260}}?\b(total value|aggregate value|target delivered value|delivered value|target value)\b[^.\n]{{0,120}}?(?:of\s+)?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(grant(?: |-)?date (?:fair )?value|aggregate grant(?: |-)?date (?:fair )?value|grant-date (?:fair )?value)\b[^.\n]{{0,140}}?({DOLLAR_RE})", re.IGNORECASE)),
+    ("equity_award", re.compile(rf"\b(annual|target)\b[^.\n]{{0,60}}?\b(long-?term incentive(?: award)?(?: opportunity)?|lti(?: award)?(?: opportunity)?|long-term stock incentive plan|ltsip|ltip|equity)\b[^.\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE)),
+    # Money-before-award phrasing (e.g., "will receive a $12,500,000 equity award ...")
+    ("equity_award", re.compile(rf"({DOLLAR_RE})[^.\n]{{0,140}}?\b(equity award|equity grant|equity awards?|restricted stock units|RSUs|stock options?|option award)\b", re.IGNORECASE)),
+    # Equity targets expressed as % of base salary (common)
+    ("equity_award", re.compile(r"\b(annual equity awards?|annual equity award|annual equity grant|annual long-?term incentive(?: award)?(?: opportunity)?|long-?term incentive(?: award)?(?: opportunity)?|lti(?: award)?(?: opportunity)?)\b[^.\n]{0,260}?\b(?:target(?: value| opportunity)?|with a target(?: value)?|at a target(?: value)?|target value)\b[^.\n]{0,120}?(\d{1,3}(?:\.\d+)?\s?%)\s+of\s+(?:his|her|the)?\s*base\s+salary", re.IGNORECASE)),
+    # Equity awards disclosed only as share/option counts (no $ value) – still useful for audit.
+    ("equity_award", re.compile(r"\b(equity award|equity grant|replacement equity award)\b[^.\n]{0,320}?\b(\d{1,3}(?:,\d{3})+)\b[^.\n]{0,40}?\b(restricted stock units|RSUs|stock options?|options?)\b", re.IGNORECASE)),
+
+    # Severance (not the primary goal for hire screening, but often included)
+    ("severance", re.compile(rf"\b(severance|termination|change in control|CIC)\b[^.\n]{{0,300}}?({DOLLAR_RE})", re.IGNORECASE)),
 ]
 
 def _dedupe(seq: List[str]) -> List[str]:
@@ -1417,11 +1429,22 @@ ONE_TIME_KWS = (
     "make-whole",
     "make whole",
     "replacement",
+    "replacement equity award",
     "new hire",
     "initial",
     "commencement",
+    "at commencement",
+    "upon commencement",
+    "upon joining",
+    "upon hire",
+    "upon employment",
+    "upon start",
+    "start date",
+    "forfeit",
+    "forfeiting",
+    "in consideration of",
+    "as consideration for",
     "makewhole",
-    "make whole",
     "special",
 )
 
@@ -1446,8 +1469,20 @@ def _match_money_group(m: re.Match) -> Optional[str]:
     if not m:
         return None
     for g in reversed(m.groups()):
-        if g and re.search(r"(?:US\$|[$€£])", g):
+        if g and re.search(r"(?:US\$|U\.S\.\$|USD|[$€£])", g, re.IGNORECASE):
             return g
+    return None
+
+
+def _match_percent_group(m: re.Match) -> Optional[str]:
+    """Return the first regex group that looks like a percentage (e.g., '150%')."""
+    if not m:
+        return None
+    for g in reversed(m.groups()):
+        if g and re.search(r"\d{1,3}(?:\.\d+)?\s?%", g):
+            # Return just the matched percent substring if the group contains extra text
+            m2 = re.search(r"\d{1,3}(?:\.\d+)?\s?%", g)
+            return m2.group(0) if m2 else g
     return None
 
 def _equity_labels(s_low: str) -> List[str]:
@@ -1512,140 +1547,199 @@ def _classify_equity_snippet(s: str) -> str:
 
 
 def extract_compensation(text: str) -> ExtractedComp:
+    """
+    Extract compensation-related terms from the provided text blob.
+
+    v4 improvements:
+      * Uses helper pickers (_match_money_group / _match_percent_group) rather than fixed group indexes.
+      * Adds support for common 8-K phrasing like:
+          - "annual cash incentive opportunity at a target of 150% of base salary"
+          - "target award under the Annual Management Incentive Program ... equal to 160% of base salary"
+          - "$12,500,000 equity award ..." (money-before-award)
+          - "aggregate grant date fair value of $X"
+      * Captures annual equity targets expressed as % of base salary and derives an estimated $ value
+        when base salary is also disclosed (stored in equity_target_annual_usd_total).
+      * Captures equity award share/option counts (when no $ value is disclosed).
+    """
     comp = ExtractedComp()
+    if not text:
+        return comp
+
+    def _extract_equity_counts(s: str) -> List[str]:
+        if not s:
+            return []
+        out: List[str] = []
+        # e.g., "85,385 restricted stock units"
+        for num in re.findall(r"\b(\d{1,3}(?:,\d{3})+)\b\s+(?:restricted stock units|RSUs?)\b", s, flags=re.IGNORECASE):
+            out.append(f"{num} RSUs")
+        # e.g., "415,295 nonqualified stock options"
+        for num in re.findall(r"\b(\d{1,3}(?:,\d{3})+)\b\s+(?:nonqualified\s+|qualified\s+)?(?:stock\s+options?|options?)\b", s, flags=re.IGNORECASE):
+            out.append(f"{num} options")
+        return _dedupe(out)
 
     for field, pat in COMP_PATTERNS:
         for m in pat.finditer(text):
-            snippet = norm_ws(text[max(0, m.start()-180): m.end()+180])
-            comp.evidence_snippets.append(snippet)
+            snip = sentence_snippet(text, m.start(), m.end(), max_len=520)
+            if snip and snip not in comp.evidence_snippets:
+                comp.evidence_snippets.append(snip)
 
-            if field == "base_salary" and comp.base_salary is None:
-                comp.base_salary = money_norm(m.group(2))
+            money = _match_money_group(m)
+            pct = _match_percent_group(m)
+
+            if field == "base_salary" and comp.base_salary is None and money:
+                comp.base_salary = money_norm(money)
                 comp.base_salary_usd = money_to_usd(comp.base_salary)
+
             elif field == "target_bonus" and comp.target_bonus is None:
-                comp.target_bonus = money_norm(m.group(2))
-                comp.target_bonus_pct = percent_to_float(comp.target_bonus)
-                if comp.target_bonus_pct is None:
+                if pct:
+                    comp.target_bonus = pct
+                    comp.target_bonus_pct = percent_to_float(pct)
+                elif money:
+                    comp.target_bonus = money_norm(money)
                     comp.target_bonus_usd = money_to_usd(comp.target_bonus)
-            elif field == "sign_on_bonus" and comp.sign_on_bonus is None:
-                comp.sign_on_bonus = money_norm(m.group(2))
+
+            elif field == "sign_on_bonus" and comp.sign_on_bonus is None and money:
+                comp.sign_on_bonus = money_norm(money)
                 comp.sign_on_bonus_usd = money_to_usd(comp.sign_on_bonus)
-            elif field == "one_time_cash":
-                cash_snip = sentence_snippet(text, m.start(), m.end())
-                comp.one_time_cash_details.append(cash_snip)
-                money = _match_money_group(m)
-                if money:
-                    comp.one_time_cash_values.append(money_norm(money))
+
+            elif field == "one_time_cash" and money:
+                comp.one_time_cash.append(money_norm(money))
 
             elif field == "equity_award":
-                eq_snip = sentence_snippet(text, m.start(), m.end())
-                comp.equity_awards.append(eq_snip)
-                money = _match_money_group(m)
+                # Keep the snippet for auditability
+                if snip:
+                    comp.equity_awards.append(snip)
+
+                eq_type = _classify_equity_snippet(snip or "")
+                labels = _equity_labels((snip or "").lower())
+
+                # Money-valued equity
                 if money:
-                    cat = _classify_equity_snippet(eq_snip)
-                    if cat == "one_time":
-                        comp.equity_one_time_details.append(eq_snip[:360])
-                        comp.equity_one_time_values.append(money_norm(money))
-                        comp.equity_one_time_labels.extend(_equity_labels(eq_snip.lower()))
-                    elif cat == "annual_target":
-                        comp.equity_target_annual_details.append(eq_snip[:360])
-                        comp.equity_target_annual_values.append(money_norm(money))
-            elif field == "severance":
-                comp.severance.append(snippet[:360])
+                    val = money_norm(money)
+                    if eq_type == "one_time":
+                        comp.equity_one_time_values.append(val)
+                        comp.equity_one_time_details.append(snip)
+                        comp.equity_one_time_labels.extend(labels)
+                    elif eq_type == "annual_target":
+                        comp.equity_target_annual_values.append(val)
+                        comp.equity_target_annual_details.append(snip)
 
-    for kw in (
-        "relocation",
-        "car allowance",
-        "housing",
-        "tax gross-up",
-        "gross-up",
-        "clawback",
-        "vesting",
-        "performance-based",
-        "change in control",
-        "CIC",
-    ):
-        if re.search(rf"\b{re.escape(kw)}\b", text, re.IGNORECASE):
-            comp.other.append(kw)
+                # Equity targets expressed as % of base salary
+                if (not money) and pct and eq_type == "annual_target":
+                    p = percent_to_float(pct)
+                    if p is not None:
+                        comp.equity_target_annual_pct_values.append(p)
+                        comp.equity_target_annual_pct_details.append(snip)
 
-    # Dedup lists
-    comp.equity_awards = _dedupe(comp.equity_awards)
-    comp.equity_target_annual_values = _dedupe(comp.equity_target_annual_values)
-    comp.equity_target_annual_details = _dedupe(comp.equity_target_annual_details)
-    comp.equity_one_time_values = _dedupe(comp.equity_one_time_values)
-    comp.equity_one_time_labels = _dedupe(comp.equity_one_time_labels)
-    comp.one_time_cash_values = _dedupe(comp.one_time_cash_values)
-    comp.one_time_cash_details = _dedupe(comp.one_time_cash_details)
-    # Numeric equity (USD) + totals for spreadsheets
-    def _dedupe_int(seq: List[Optional[int]]) -> List[int]:
-        seen_i: Set[int] = set()
-        out_i: List[int] = []
-        for v in seq:
-            if v is None:
-                continue
-            if v in seen_i:
-                continue
-            seen_i.add(v)
-            out_i.append(v)
-        return out_i
+                # Counts-only equity awards (useful even without $ valuation)
+                if (not money) and (not pct) and snip:
+                    counts = _extract_equity_counts(snip)
+                    if counts:
+                        if eq_type == "one_time":
+                            comp.equity_one_time_counts.extend(counts)
+                            comp.equity_one_time_labels.extend(labels)
+                            comp.equity_one_time_details.append(snip)
+                        elif eq_type == "annual_target":
+                            comp.equity_target_annual_counts.extend(counts)
+                            comp.equity_target_annual_details.append(snip)
 
-    # Numeric one-time cash (USD) + total
-    comp.one_time_cash_values_usd = _dedupe_int([money_to_usd(x) for x in comp.one_time_cash_values])
-    comp.one_time_cash_usd_total = int(sum(comp.one_time_cash_values_usd)) if comp.one_time_cash_values_usd else None
+            elif field == "severance" and money:
+                comp.severance.append(money_norm(money))
 
-    comp.equity_target_annual_values_usd = _dedupe_int([money_to_usd(x) for x in comp.equity_target_annual_values])
-    comp.equity_one_time_values_usd = _dedupe_int([money_to_usd(x) for x in comp.equity_one_time_values])
+    # --- Normalize / compute numeric totals ---
+    comp.one_time_cash = _dedupe([x for x in comp.one_time_cash if x])
+    if comp.one_time_cash:
+        comp.one_time_cash_usd = [money_to_usd(x) for x in comp.one_time_cash if money_to_usd(x) is not None]
+        comp.one_time_cash_usd_total = sum(comp.one_time_cash_usd) if comp.one_time_cash_usd else None
 
-    comp.equity_target_annual_usd_total = sum(comp.equity_target_annual_values_usd) if comp.equity_target_annual_values_usd else None
-    comp.equity_one_time_usd_total = sum(comp.equity_one_time_values_usd) if comp.equity_one_time_values_usd else None
+    comp.equity_target_annual_values = _dedupe([x for x in comp.equity_target_annual_values if x])
+    comp.equity_one_time_values = _dedupe([x for x in comp.equity_one_time_values if x])
 
-    if comp.equity_target_annual_usd_total is not None or comp.equity_one_time_usd_total is not None:
-        comp.equity_total_usd = int((comp.equity_target_annual_usd_total or 0) + (comp.equity_one_time_usd_total or 0))
+    if comp.equity_target_annual_values:
+        comp.equity_target_annual_values_usd = [money_to_usd(x) for x in comp.equity_target_annual_values if money_to_usd(x) is not None]
+        comp.equity_target_annual_usd_total = sum(comp.equity_target_annual_values_usd) if comp.equity_target_annual_values_usd else None
 
-    comp.equity_one_time_details = _dedupe(comp.equity_one_time_details)
+    if comp.equity_one_time_values:
+        comp.equity_one_time_values_usd = [money_to_usd(x) for x in comp.equity_one_time_values if money_to_usd(x) is not None]
+        comp.equity_one_time_usd_total = sum(comp.equity_one_time_values_usd) if comp.equity_one_time_values_usd else None
 
-    comp.severance = _dedupe(comp.severance)
-    comp.other = _dedupe(comp.other)
-    comp.evidence_snippets = _dedupe(comp.evidence_snippets)
-    # Compute target_bonus_usd from pct if needed (common in filings)
-    if comp.target_bonus_usd is None and comp.target_bonus_pct is not None and comp.base_salary_usd is not None:
+    # If annual equity target is expressed only as % of base salary, derive an estimated $ amount.
+    if (comp.equity_target_annual_usd_total is None) and comp.equity_target_annual_pct_values and comp.base_salary_usd:
+        # Use the first captured target % (best-effort; patterns bias toward "target" language)
+        pct_val = comp.equity_target_annual_pct_values[0]
         try:
-            comp.target_bonus_usd = int(round(comp.base_salary_usd * (float(comp.target_bonus_pct) / 100.0)))
+            derived = int(round(comp.base_salary_usd * (pct_val / 100.0)))
+            comp.equity_target_annual_usd_total = derived
         except Exception:
             pass
 
+    # Compute combined equity (annual + one-time) if either side exists
+    annual = comp.equity_target_annual_usd_total or 0
+    one_time = comp.equity_one_time_usd_total or 0
+    if annual or one_time:
+        comp.equity_total_usd = annual + one_time
+
+    # De-dupe + clean lists
+    comp.equity_awards = _dedupe([x for x in comp.equity_awards if x])
+    comp.equity_target_annual_details = _dedupe([x for x in comp.equity_target_annual_details if x])
+    comp.equity_one_time_details = _dedupe([x for x in comp.equity_one_time_details if x])
+    comp.equity_one_time_labels = _dedupe([x for x in comp.equity_one_time_labels if x])
+
+    comp.equity_target_annual_pct_values = _dedupe([float(x) for x in comp.equity_target_annual_pct_values if x is not None])
+    comp.equity_target_annual_pct_details = _dedupe([x for x in comp.equity_target_annual_pct_details if x])
+
+    comp.equity_target_annual_counts = _dedupe([x for x in comp.equity_target_annual_counts if x])
+    comp.equity_one_time_counts = _dedupe([x for x in comp.equity_one_time_counts if x])
+
+    comp.severance = _dedupe([x for x in comp.severance if x])
+    comp.other = _dedupe([x for x in comp.other if x])
+
+    # Keep only a reasonable number of evidence snippets (avoid huge payloads)
+    comp.evidence_snippets = _dedupe([x for x in comp.evidence_snippets if x])[:40]
 
     return comp
-
 def compensation_brief(comp: ExtractedComp) -> str:
+    """
+    Human-friendly one-liner used in the Streamlit table export.
+
+    Note: This is a convenience summary; the raw snippets + the filing link are the audit trail.
+    """
     bits: List[str] = []
+
     if comp.base_salary:
-        bits.append(f"Base salary {comp.base_salary}")
-    if comp.target_bonus:
+        bits.append(f"Salary {comp.base_salary}")
+
+    if comp.target_bonus_pct is not None:
+        bits.append(f"Target bonus {comp.target_bonus_pct:.0f}%")
+    elif comp.target_bonus:
         bits.append(f"Target bonus {comp.target_bonus}")
-    if comp.one_time_cash_usd_total is not None:
+
+    if comp.equity_target_annual_usd_total:
+        bits.append(f"Annual equity target ${comp.equity_target_annual_usd_total:,}")
+    elif comp.equity_target_annual_pct_values:
+        pcts = ", ".join([f"{p:.0f}%" for p in comp.equity_target_annual_pct_values[:3]])
+        bits.append(f"Annual equity target {pcts} of base salary")
+
+    if comp.equity_one_time_usd_total:
+        bits.append(f"One-time equity ${comp.equity_one_time_usd_total:,}")
+
+    # If we only have counts (no $ value), include them so results don't look empty.
+    if comp.equity_target_annual_counts:
+        bits.append("Annual equity counts " + ", ".join(comp.equity_target_annual_counts[:3]))
+    if comp.equity_one_time_counts:
+        bits.append("One-time equity counts " + ", ".join(comp.equity_one_time_counts[:3]))
+
+    if comp.sign_on_bonus:
+        bits.append(f"Sign-on bonus {comp.sign_on_bonus}")
+
+    if comp.one_time_cash_usd_total:
         bits.append(f"One-time cash ${comp.one_time_cash_usd_total:,}")
+    elif comp.one_time_cash:
+        bits.append("One-time cash " + ", ".join(comp.one_time_cash[:2]))
 
-    if comp.equity_target_annual_values:
-        bits.append("Equity target/annual " + ", ".join(comp.equity_target_annual_values))
-    if comp.equity_one_time_values:
-        lab = f" ({', '.join(comp.equity_one_time_labels)})" if comp.equity_one_time_labels else ""
-        bits.append("One-time equity " + ", ".join(comp.equity_one_time_values) + lab)
-
-    # Fallback if we saw equity snippets but couldn't extract $ values
-    if not comp.equity_target_annual_values and not comp.equity_one_time_values and comp.equity_awards:
-        bits.append(f"Equity mentions {len(comp.equity_awards)}")
-
-    if comp.severance:
-        bits.append(f"Severance/CIC mentions {len(comp.severance)}")
-    if comp.other:
-        bits.append("Other: " + ", ".join(comp.other))
-    return "; ".join(bits) if bits else "No comp terms detected in scanned docs/exhibits."
-
-# -----------------------------
-# Summarization
-# -----------------------------
-
+    if not bits:
+        return "No comp terms detected in scanned docs/exhibits."
+    return "; ".join(bits)
 def build_summary(event: ExecEvent) -> str:
     f = event.filing
     comp = event.compensation
@@ -1703,55 +1797,188 @@ def _build_name_variants_for_search(name: str) -> List[str]:
 def build_focus_text_for_match(
     match: ExecMatch,
     text_sources: List[Tuple[str, str]],
-    max_total_snips: int = 16,
+    max_total_snips: int = 18,
     per_source_snips: int = 4,
+    pre_chars: int = 260,
+    post_chars: int = 2800,
 ) -> str:
-    """Build a tighter text blob around a specific executive to reduce comp 'contamination'."""
+    """Build a comp-focused text blob around a specific executive.
+
+    Why this exists:
+      * Bio paragraphs tend to appear early and repeat the executive's name many times.
+      * Pay terms often appear later (and may not repeat the full name in every sentence).
+      * A naive "first N occurrences" approach frequently misses compensation terms.
+
+    Method:
+      1) Generate candidate windows around ALL occurrences of name variants.
+      2) Score windows for compensation signals ($, %, comp keywords).
+      3) Keep the highest-scoring windows per source.
+      4) Truncate a window if another (different) executive is introduced (Mr./Ms./Dr. <LastName>).
+
+    This improves recall on salary/bonus/equity terms while still reducing cross-executive contamination.
+    """
     parts: List[str] = []
     if match.context:
         parts.append(match.context)
 
+    # Determine the target last name (used for truncation heuristics)
+    toks = _name_tokens(_strip_honorific_and_suffix(match.name or ""))
+    target_last = toks[-1] if toks else ""
+
     variants = _build_name_variants_for_search(match.name)
 
-    for _, txt in text_sources:
+    comp_kws = (
+        "base salary",
+        "salary",
+        "cash incentive",
+        "incentive",
+        "bonus",
+        "amip",
+        "aip",
+        "mip",
+        "icp",
+        "short-term incentive",
+        "short term incentive",
+        "sti",
+        "annual incentive",
+        "long-term incentive",
+        "long term incentive",
+        "lti",
+        "ltip",
+        "ltsip",
+        "equity",
+        "restricted stock",
+        "rsu",
+        "stock option",
+        "options",
+        "grant date",
+        "grant-date",
+        "grant",
+        "award",
+        "sign-on",
+        "signing",
+        "inducement",
+        "make-whole",
+        "make whole",
+        "replacement",
+        "forfeit",
+        "forfeiting",
+        "offer letter",
+        "employment agreement",
+        "severance",
+        "change in control",
+        "relocation",
+        "reimburse",
+        "reimbursement",
+        "legal fees",
+    )
+
+    bio_noise_kws = (
+        "age",
+        "served as",
+        "since",
+        "from ",
+        "prior to",
+        "previously",
+        "years",
+        "degree",
+        "bachelor",
+        "master",
+        "ph.d",
+        "board of directors",
+        "director",
+    )
+
+    honorific_re = re.compile(r"\b(Mr|Ms|Mrs|Dr)\.\s+([A-Z][A-Za-z\-']+)\b")
+
+    def _truncate_at_other_person(snip: str) -> str:
+        if not snip or not target_last:
+            return snip
+        # Find the first mention of a *different* person introduced by an honorific
+        for m in honorific_re.finditer(snip):
+            last = (m.group(2) or "").strip()
+            if last and last.lower() != target_last.lower():
+                # Don't truncate at the very beginning (avoid chopping a mid-sentence snip)
+                if m.start() >= 80:
+                    return snip[: m.start()].strip()
+        return snip
+
+    def _score(snip: str) -> int:
+        if not snip:
+            return -10
+        s_low = snip.lower()
+        score = 0
+        score += 10 * len(re.findall(r"(?:US\$|[$€£])", snip))
+        score += 6 * snip.count("%")
+        score += 2 * len(re.findall(r"\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b", snip))
+        for kw in comp_kws:
+            if kw in s_low:
+                score += 3
+        for kw in bio_noise_kws:
+            if kw in s_low:
+                score -= 1
+        if "base salary" in s_low and ("%" in snip or "$" in snip):
+            score += 4
+        return score
+
+    # Collect candidate windows per source
+    candidates: List[Tuple[int, str, str]] = []  # (score, label, snippet)
+    for label, txt in text_sources:
         if not txt:
             continue
-        snips_this = 0
+        # For each variant, capture all occurrences (we'll down-select by score)
         for v in variants:
-            # Case-insensitive substring search
             for m in re.finditer(re.escape(v), txt, flags=re.IGNORECASE):
-                parts.append(sentence_snippet(txt, m.start(), m.end(), max_len=520))
-                snips_this += 1
-                if snips_this >= per_source_snips:
-                    break
-            if snips_this >= per_source_snips:
-                break
+                start = max(0, m.start() - pre_chars)
+                end = min(len(txt), m.end() + post_chars)
+                snip = txt[start:end].strip()
+                snip = _truncate_at_other_person(snip)
+                score = _score(snip)
+                candidates.append((score, label, snip))
+
+    # Prefer high-scoring snippets (comp-rich) over early bio snippets
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    per_source_used: Dict[str, int] = {}
+    seen: Set[str] = set()
+    for score, label, snip in candidates:
+        if not snip:
+            continue
+        # Skip very low-signal snippets unless we have nothing else
+        if score < 2 and len(parts) > 1:
+            continue
+        if per_source_used.get(label, 0) >= per_source_snips:
+            continue
+        k = norm_ws(snip).strip().lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        parts.append(snip)
+        per_source_used[label] = per_source_used.get(label, 0) + 1
         if len(parts) >= max_total_snips:
             break
 
-    # If we still have very little, fall back to including the whole Item 5.02 slice for the primary doc.
+    # If we still have very little (or no pay-like signals), fall back to Item 5.02 slice for the primary doc.
     if len(parts) < 3:
         for label, txt in text_sources:
-            if label == "primary":
+            if label == "primary" and txt:
                 parts.append(slice_item_502(txt))
                 break
 
     # De-dupe while preserving order
-    seen: Set[str] = set()
+    seen2: Set[str] = set()
     out_parts: List[str] = []
     for p in parts:
         p2 = norm_ws(p).strip()
         if not p2:
             continue
         k = p2.lower()
-        if k in seen:
+        if k in seen2:
             continue
-        seen.add(k)
+        seen2.add(k)
         out_parts.append(p2)
 
     return "\n\n".join(out_parts).strip()
-
-
 def process_filing(
     client: SecEdgarClient,
     store: Store,
