@@ -23,7 +23,7 @@ st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
 CACHE_DIR = Path(".cache_edgar")
-SCANNER = Path("exec_8k_scanner.py")
+SCANNER = Path("exec_8k_scanner_v5.py")
 
 
 # ----------
@@ -82,7 +82,6 @@ def run_scan(
     as_of_date: dt.date,
     max_rps: int,
     force: bool,
-    relaxed: bool,
     mode: str = "submissions",
 ) -> Tuple[int, str, str]:
     """Run the scanner as a subprocess. Returns (exit_code, stdout, stderr)."""
@@ -131,8 +130,6 @@ def run_scan(
         ]
         if force:
             cmd.append("--force")
-        if relaxed:
-            cmd.append("--relaxed")
 
         proc = subprocess.run(cmd, capture_output=True, text=True)
         return proc.returncode, proc.stdout, proc.stderr
@@ -230,13 +227,16 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
                 pass
 
         equity_annual_usd = comp.get("equity_target_annual_usd_total")
+        equity_annual_advance_usd = comp.get("equity_annual_advance_usd_total")
+        equity_annual_pregrant_usd = comp.get("equity_annual_pregrant_usd_total")
+
 
         # One-time cash: prefer curated field; fall back to older sign_on_bonus_usd
         one_time_cash_usd_total = comp.get("one_time_cash_usd_total")
         if one_time_cash_usd_total in (None, ""):
             one_time_cash_usd_total = comp.get("sign_on_bonus_usd")
 
-        one_time_cash_values = comp.get("one_time_cash") or []
+        one_time_cash_values = comp.get("one_time_cash_values") or []
         if (not one_time_cash_values) and comp.get("sign_on_bonus"):
             one_time_cash_values = [comp.get("sign_on_bonus")]
 
@@ -247,9 +247,6 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
 
         # Annual/target equity/LTI values (ongoing)
         equity_target_values = comp.get("equity_target_annual_values") or []
-        equity_target_pct_values = comp.get("equity_target_annual_pct_values") or []
-        equity_target_counts = comp.get("equity_target_annual_counts") or []
-        equity_one_time_counts = comp.get("equity_one_time_counts") or []
 
         # Evidence snippets for traceability
         evidence_snips = comp.get("evidence_snippets") or []
@@ -276,6 +273,10 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
                     parts.append(f"Target bonus ${int(target_bonus_usd):,}")
             if equity_annual_usd not in (None, ""):
                 parts.append(f"Target/annual equity ${int(equity_annual_usd):,}")
+            if equity_annual_advance_usd not in (None, ""):
+                parts.append(f"Annual equity advance ${int(equity_annual_advance_usd):,}")
+            if equity_annual_pregrant_usd not in (None, ""):
+                parts.append(f"Annual equity (pregrant) ${int(equity_annual_pregrant_usd):,}")
             if one_time_cash_usd_total not in (None, ""):
                 parts.append(f"One-time cash ${int(one_time_cash_usd_total):,}")
             if equity_one_time_usd_total not in (None, ""):
@@ -288,18 +289,15 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
             # IDs/links
             "accession": accession,
             "source_8k_url": source_8k_url,
-                        "primary_doc_url": primary_doc_url,
-
-            # Item 5.02 classification (debug / audit)
-            "filing_category": (obj.get("filing_category") or ""),
-            "item_502_subitems": ", ".join(((obj.get("item_502_signals") or {}).get("subitems") or [])),
-            "strict_mode": ((obj.get("match_signals") or {}).get("strict", True)),
+            "primary_doc_url": primary_doc_url,
 
             # Curated numeric fields
             "base_salary_usd": base_salary_usd,
             "target_bonus_pct": target_bonus_pct,
             "target_bonus_usd": target_bonus_usd,
             "equity_target_annual_usd_total": equity_annual_usd,
+            "equity_annual_advance_usd_total": equity_annual_advance_usd,
+            "equity_annual_pregrant_usd_total": equity_annual_pregrant_usd,
             "target_total_comp_usd": target_total_comp_usd,
             "one_time_cash_usd_total": one_time_cash_usd_total,
             "equity_one_time_usd_total": equity_one_time_usd_total,
@@ -309,9 +307,8 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
             "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
             "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
             "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
-            "equity_target_annual_pct_values": "; ".join([f"{float(x):g}%" for x in equity_target_pct_values if x is not None]),
-            "equity_target_annual_counts": "; ".join([str(x) for x in equity_target_counts if x]),
-            "equity_one_time_counts": "; ".join([str(x) for x in equity_one_time_counts if x]),
+            "equity_annual_advance_values": "; ".join([str(x) for x in (comp.get("equity_annual_advance_values") or []) if x]),
+            "equity_annual_pregrant_values": "; ".join([str(x) for x in (comp.get("equity_annual_pregrant_values") or []) if x]),
             "other_keywords": ", ".join(other),
             "compensation_summary": "; ".join(parts) if parts else "No comp terms detected in scanned docs/exhibits.",
             "evidence_snippets": evidence_text,
@@ -346,9 +343,6 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         "compensation_summary",
         "one_time_cash_values",
         "equity_target_annual_values",
-        "equity_target_annual_pct_values",
-        "equity_target_annual_counts",
-        "equity_one_time_counts",
         "equity_one_time_values",
         "equity_one_time_labels",
         "other_keywords",
@@ -415,12 +409,6 @@ with st.sidebar.expander("Advanced"):
         value=False,
         help="Turn on once after updating the extractor to refresh older saved results in the SQLite DB.",
     )
-    relaxed = st.checkbox(
-        "Relax match filters (debug)",
-        value=False,
-        help="If enabled, the scanner will be less strict about appointment/title filters (may increase false positives).",
-    )
-
     show_audit_cols = st.checkbox(
         "Show audit columns in Results table",
         value=False,
@@ -471,7 +459,6 @@ if run_clicked:
                     as_of_date=as_of_date,
                     max_rps=max_rps,
                     force=force,
-                    relaxed=relaxed,
                     mode=mode,
                 )
 
