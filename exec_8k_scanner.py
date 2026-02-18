@@ -2078,6 +2078,7 @@ def process_filing(
     def _best_focus_text(mm: ExecMatch) -> str:
         variants = _name_variants(mm.name)
         last = variants[1] if len(variants) > 1 else variants[0] if variants else ""
+        core = variants[0] if variants else ""
         windows: List[Tuple[float, str]] = []
 
         # Always include the local appointment context from the match
