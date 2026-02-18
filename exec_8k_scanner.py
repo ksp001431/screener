@@ -1649,6 +1649,76 @@ def extract_compensation(text: str) -> ExtractedComp:
 
 
 
+def compensation_brief(comp: Optional[ExtractedComp]) -> str:
+    """Compact human-readable comp summary used in markdown/CSV outputs.
+
+    IMPORTANT: This is *heuristic* and may omit terms; always review the underlying 8-K and exhibits.
+    """
+    if comp is None:
+        return "No comp terms detected in scanned docs/exhibits."
+
+    bits: List[str] = []
+
+    # Salary / bonus
+    if comp.base_salary:
+        bits.append(f"Salary {comp.base_salary}")
+
+    if comp.target_bonus:
+        # If target_bonus is a percent string we try to include the parsed pct; if it's a $ amount, pct may be None.
+        if comp.target_bonus_pct is not None:
+            bits.append(f"Target bonus {comp.target_bonus} ({float(comp.target_bonus_pct):g}%)")
+        else:
+            bits.append(f"Target bonus {comp.target_bonus}")
+
+    # One-time cash
+    if comp.one_time_cash_usd_total is not None:
+        bits.append(f"One-time cash ${int(comp.one_time_cash_usd_total):,}")
+    elif comp.one_time_cash_values:
+        bits.append("One-time cash " + ", ".join(comp.one_time_cash_values))
+
+    # Annual/target equity (ongoing year)
+    if comp.equity_target_annual_usd_total is not None:
+        bits.append(f"Annual/target equity ${int(comp.equity_target_annual_usd_total):,}")
+    elif comp.equity_target_annual_values:
+        bits.append("Annual/target equity " + ", ".join(comp.equity_target_annual_values))
+
+    # One-time equity (make-whole / sign-on / inducement)
+    if comp.equity_one_time_usd_total is not None:
+        lab = f" ({', '.join(comp.equity_one_time_labels)})" if comp.equity_one_time_labels else ""
+        bits.append(f"One-time equity ${int(comp.equity_one_time_usd_total):,}" + lab)
+    elif comp.equity_one_time_values:
+        lab = f" ({', '.join(comp.equity_one_time_labels)})" if comp.equity_one_time_labels else ""
+        bits.append("One-time equity " + ", ".join(comp.equity_one_time_values) + lab)
+
+    # Nuanced equity timing buckets (kept separate from annual target to avoid double counting)
+    if comp.equity_annual_advance_usd_total is not None:
+        bits.append(f"Equity advance ${int(comp.equity_annual_advance_usd_total):,}")
+    elif comp.equity_annual_advance_values:
+        bits.append("Equity advance " + ", ".join(comp.equity_annual_advance_values))
+
+    if comp.equity_annual_pregrant_usd_total is not None:
+        bits.append(f"Multi-year annual pre-grant ${int(comp.equity_annual_pregrant_usd_total):,}")
+    elif comp.equity_annual_pregrant_values:
+        bits.append("Multi-year annual pre-grant " + ", ".join(comp.equity_annual_pregrant_values))
+
+    # Fallback if we saw equity snippets but couldn't extract $ values
+    if (
+        not comp.equity_target_annual_values
+        and not comp.equity_one_time_values
+        and not comp.equity_annual_advance_values
+        and not comp.equity_annual_pregrant_values
+        and comp.equity_awards
+    ):
+        bits.append(f"Equity mentions {len(comp.equity_awards)}")
+
+    if comp.severance:
+        bits.append(f"Severance/CIC mentions {len(comp.severance)}")
+    if comp.other:
+        bits.append("Other: " + ", ".join(comp.other))
+
+    return "; ".join(bits) if bits else "No comp terms detected in scanned docs/exhibits."
+
+
 # -----------------------------
 # Summarization
 # -----------------------------
