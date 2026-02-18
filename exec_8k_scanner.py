@@ -219,6 +219,7 @@ class ExecEvent:
     confidence: float
     person: Optional[str] = None
     matched_title: Optional[str] = None
+    matched_title_raw: Optional[str] = None
     effective_date: Optional[str] = None
     event_type: Optional[str] = None  # hire | promotion | interim | unknown
     compensation: Optional[ExtractedComp] = None
@@ -967,6 +968,146 @@ POSITION_SYNONYMS: Dict[str, List[str]] = {
     "CAO": ["Chief Accounting Officer", "CAO", "Principal Accounting Officer"],
     "CLO": ["Chief Legal Officer", "CLO"],
 }
+
+# -----------------------------
+# Title normalization (display)
+# -----------------------------
+
+TITLE_ABBREV_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\bChief\s+Executive\s+Officer\b", re.IGNORECASE), "CEO"),
+    (re.compile(r"\bPrincipal\s+Executive\s+Officer\b", re.IGNORECASE), "CEO"),
+    (re.compile(r"\bChief\s+Financial\s+Officer\b", re.IGNORECASE), "CFO"),
+    (re.compile(r"\bPrincipal\s+Financial\s+Officer\b", re.IGNORECASE), "CFO"),
+    (re.compile(r"\bChief\s+Operating\s+Officer\b", re.IGNORECASE), "COO"),
+    (re.compile(r"\bPrincipal\s+Operating\s+Officer\b", re.IGNORECASE), "COO"),
+    (re.compile(r"\bChief\s+Accounting\s+Officer\b", re.IGNORECASE), "CAO"),
+    (re.compile(r"\bPrincipal\s+Accounting\s+Officer\b", re.IGNORECASE), "CAO"),
+    (re.compile(r"\bChief\s+Legal\s+Officer\b", re.IGNORECASE), "CLO"),
+    (re.compile(r"\bChief\s+Human\s+Resources\s+Officer\b", re.IGNORECASE), "CHRO"),
+    (re.compile(r"\bChief\s+Information\s+Officer\b", re.IGNORECASE), "CIO"),
+    (re.compile(r"\bChief\s+Technology\s+Officer\b", re.IGNORECASE), "CTO"),
+    (re.compile(r"\bChief\s+Marketing\s+Officer\b", re.IGNORECASE), "CMO"),
+    (re.compile(r"\bSenior\s+Vice\s+President\b", re.IGNORECASE), "SVP"),
+    (re.compile(r"\bExecutive\s+Vice\s+President\b", re.IGNORECASE), "EVP"),
+    (re.compile(r"\bVice\s+President\b", re.IGNORECASE), "VP"),
+]
+
+# Lower number = earlier in title display
+_TITLE_ORDER: Dict[str, int] = {
+    "Chairman": 10,
+    "Chair": 10,
+    "President": 20,
+    "EVP": 30,
+    "SVP": 40,
+    "VP": 50,
+    "CEO": 90,
+    "CFO": 91,
+    "COO": 92,
+    "CAO": 93,
+    "CLO": 94,
+    "CHRO": 95,
+    "CIO": 96,
+    "CTO": 97,
+    "CMO": 98,
+    "Treasurer": 110,
+}
+
+
+def normalize_position_title(raw_title: str, position_query: str, is_interim: bool = False) -> str:
+    """Normalize a matched title snippet to a compact display title (not a full sentence).
+
+    Examples:
+      - "Target's next Chief Executive Officer" -> "CEO"
+      - "Executive Vice President and Chief Financial Officer" -> "EVP & CFO"
+      - "Chairman and Chief Executive Officer" -> "Chairman & CEO"
+      - "President & Chief Executive Officer" -> "President & CEO"
+    """
+    t = norm_ws(raw_title or "")
+    # Drop trailing parentheticals (often definitions like “the CEO”)
+    t = re.sub(r"\s*\([^\)]*\)\s*$", "", t).strip()
+    if not t:
+        return (position_query or "").strip()
+
+    # Remove trailing punctuation/clauses (we want a title, not a sentence)
+    t = re.split(r"[\.;:\n\r]", t, maxsplit=1)[0].strip()
+    t = re.split(r"\b(?:effective|with\s+effect|beginning|commencing|starting|as\s+of)\b", t, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+    # Remove common leading fluff / possessives (before and after abbreviation)
+    def _strip_leading(s: str) -> str:
+        s2 = s.strip()
+        s2 = re.sub(r"^(?:the|our|its)\s+", "", s2, flags=re.IGNORECASE)
+        s2 = re.sub(r"^[A-Za-z0-9&\.-]+['’]s\s+", "", s2, flags=re.IGNORECASE)  # "Target's"
+        s2 = re.sub(r"^(?:next|new|incoming|successor|designated|interim|acting)\s+", "", s2, flags=re.IGNORECASE)
+        s2 = re.sub(r"^(?:to\s+serve\s+as|as)\s+", "", s2, flags=re.IGNORECASE)
+        return s2.strip()
+
+    t = _strip_leading(t)
+
+    # Abbreviate common title phrases
+    for pat, repl in TITLE_ABBREV_PATTERNS:
+        t = pat.sub(repl, t)
+
+    # Strip leading fluff again (e.g., "next CEO")
+    t = _strip_leading(t)
+
+    # Remove trailing "of the Company" type phrases
+    t = re.split(r"\bof\s+(?:the\s+)?(?:company|corporation|registrant|issuer)\b", t, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+    # Normalize connectors
+    t = re.sub(r"\s+and\s+", " & ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*&\s*", " & ", t)
+    t = re.sub(r"\s+,\s+", ", ", t)
+
+    # Remove remaining fluff words that sometimes cling to titles
+    t = re.sub(r"\b(?:next|new|incoming|successor|designated)\b", "", t, flags=re.IGNORECASE)
+    t = norm_ws(t)
+
+    # If we have an interim appointment, reflect it explicitly
+    interim_flag = is_interim or bool(re.search(r"\binterim\b|\bacting\b", raw_title or "", re.IGNORECASE))
+    if interim_flag:
+        t = re.sub(r"\binterim\b|\bacting\b", "", t, flags=re.IGNORECASE)
+        t = norm_ws(t)
+        if t and not t.lower().startswith("interim"):
+            t = "Interim " + t
+
+    # If after cleaning it still contains a lot of context words, fall back to the canonical role
+    upq = (position_query or "").strip().upper()
+    if upq in POSITION_SYNONYMS and any(tok in (t or "") for tok in ("CEO", "CFO", "COO", "CAO", "CLO", "CHRO", "CIO", "CTO", "CMO")):
+        pass
+    elif upq in POSITION_SYNONYMS:
+        # If we can't confidently form a good title, display the requested role
+        return ("Interim " + upq) if interim_flag else upq
+
+    # Reorder components using a simple precedence map (keeps titles consistent)
+    parts = [p.strip() for p in re.split(r"\s*&\s*|,", t) if p and p.strip()]
+    if parts:
+        # Keep original casing for known tokens, title-case unknown tokens
+        def _canon(x: str) -> str:
+            x2 = x.strip()
+            # standardize common tokens
+            for tok in _TITLE_ORDER.keys():
+                if x2.upper() == tok.upper():
+                    return tok
+            # Preserve CEO/CFO etc
+            if re.fullmatch(r"(?:CEO|CFO|COO|CAO|CLO|CHRO|CIO|CTO|CMO|EVP|SVP|VP)", x2, flags=re.IGNORECASE):
+                return x2.upper()
+            # Otherwise keep as-is (but strip lingering quotes)
+            return x2.strip("“”\"'")
+
+        parts2 = [_canon(p) for p in parts]
+        parts2 = [p for p in parts2 if p]
+        # Sort only known tokens; keep unknown tokens at the end preserving order
+        known = [p for p in parts2 if p in _TITLE_ORDER]
+        unknown = [p for p in parts2 if p not in _TITLE_ORDER]
+        known_sorted = sorted(known, key=lambda x: _TITLE_ORDER.get(x, 999))
+        parts2 = known_sorted + unknown
+        t = " & ".join([p for i,p in enumerate(parts2) if p and p not in set(parts2[:i])])
+
+    t = norm_ws(t).strip(" .,-")
+    if not t:
+        return (("Interim " + upq) if interim_flag and upq else (upq or norm_ws(raw_title)))
+    return t
+
 
 APPOINT_VERBS = [
     r"appoint(?:ed|s)?",
@@ -2220,7 +2361,8 @@ def process_filing(
             detected=True,
             confidence=confidence,
             person=mm.name,
-            matched_title=mm.title,
+            matched_title=normalize_position_title(mm.title, position_query=position_query, is_interim=mm.is_interim),
+            matched_title_raw=mm.title,
             effective_date=mm.effective_date,
             event_type=mm.event_type,
             compensation=comp,

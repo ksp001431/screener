@@ -23,7 +23,7 @@ st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
 CACHE_DIR = Path(".cache_edgar")
-SCANNER = Path("exec_8k_scanner.py")
+SCANNER = Path("exec_8k_scanner_v6_7.py")
 
 
 # ----------
@@ -556,6 +556,7 @@ else:
         "company_name",
         "filing_date",
         "source_8k_url",
+        "primary_doc_url",
         "new_executive",
         "position",
         "effective_date",
@@ -577,9 +578,8 @@ else:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "source_8k_url": st.column_config.LinkColumn("8‑K", display_text="Open 8‑K"),
-            "primary_doc_url": st.column_config.LinkColumn("Primary doc", display_text="Open"),
-
+                       "source_8k_url": st.column_config.LinkColumn("8‑K index", display_text="Open"),
+            "primary_doc_url": st.column_config.LinkColumn("Primary 8‑K", display_text="Open"),
             # Currency formatting (USD assumed)
             "base_salary_usd": st.column_config.NumberColumn("Salary", format="dollar", step=1),
             "target_bonus_usd": st.column_config.NumberColumn("Bonus target (USD)", format="dollar", step=1),
