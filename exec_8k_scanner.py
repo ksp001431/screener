@@ -334,6 +334,48 @@ def norm_ws(s: str) -> str:
     return WS_RE.sub(" ", s).strip()
 
 
+# -----------------------------
+# Sentence/clause splitting helpers (abbreviation-safe)
+# -----------------------------
+_ABBREV_DOT = "<DOT>"
+ABBREV_PROTECT_RE = re.compile(r"\b(Mr|Ms|Mrs|Dr|Prof|Sr|Jr)\.", re.IGNORECASE)
+
+def _protect_abbrev_periods(s: str) -> str:
+    # Prevent sentence/clauses splitters from breaking on honorific abbreviations like "Mr."
+    return ABBREV_PROTECT_RE.sub(lambda m: f"{m.group(1)}{_ABBREV_DOT}", s)
+
+def _unprotect_abbrev_periods(s: str) -> str:
+    return s.replace(_ABBREV_DOT, ".")
+
+def split_clauses(text: str) -> List[str]:
+    """Split text into clauses on '.' and ';' while avoiding splits on common abbreviations (Mr., Ms., etc.)."""
+    if not text:
+        return []
+    t = _protect_abbrev_periods(norm_ws(text))
+    parts = re.split(r"(?<=[\.;])\s+", t)
+    out: List[str] = []
+    for p in parts:
+        p = _unprotect_abbrev_periods(p).strip()
+        if p:
+            out.append(p)
+    return out
+
+def dedupe_clauses_text(text: str) -> str:
+    """Deduplicate repeated clauses (common when overlapping focus windows are concatenated)."""
+    clauses = split_clauses(text)
+    seen: Set[str] = set()
+    kept: List[str] = []
+    for c in clauses:
+        key = re.sub(r"\s+", " ", c).strip().lower()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(c)
+    return " ".join(kept).strip()
+
+
 def sentence_snippet(text: str, start: int, end: int, max_len: int = 420) -> str:
     """Extract a sentence-ish snippet around a match to avoid mixing adjacent comp terms."""
     if not text:
@@ -1191,6 +1233,13 @@ re.compile(
     r"[^.:\n]{0,180}?\bof\b[^.:\n]{0,60}?\b(?:annual\s+)?base\s+salary\b",
     re.IGNORECASE,
 ),
+
+    # "annual target cash bonus equal to 200% of his/her base salary" (FactSet-style wording)
+    re.compile(
+        r"\b(?:annual\s+)?target\s+(?:cash\s+)?bonus\b[^.:\n]{0,220}?\b(?:equal\s+to|of|at)\b[^.:\n]{0,80}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^.:\n]{0,140}?\bof\b[^.:\n]{0,80}?\b(?:his|her|the)?\s*base\s+salary\b",
+        re.IGNORECASE,
+    ),
 ]
 
 TARGET_BONUS_USD_PATTERNS: List[re.Pattern] = [
@@ -1432,9 +1481,13 @@ def _canonical_money_str(s: str) -> str:
 
 
 def _money_key(bucket: str, amount_usd: Optional[int], award_type: str, clause_low: str) -> str:
-    # Dedupe key that preserves legitimate duplicates like $16.5M RSU + $16.5M PSU.
-    years = sorted(set(re.findall(r"\b(20\d{2})\b", clause_low)))
-    year_key = ",".join(years)
+    """Stable dedupe key for monetary amounts.
+
+    We intentionally avoid using large chunks of context (which can vary when overlapping focus windows
+    are concatenated) so we don't double-count the same award mentioned twice.
+
+    Legitimate duplicates are preserved via award_type (e.g., $16.5M RSU + $16.5M PSU).
+    """
     frac = ""
     if re.search(r"\bone[-\s]?third\b", clause_low):
         frac = "one_third"
@@ -1443,14 +1496,7 @@ def _money_key(bucket: str, amount_usd: Optional[int], award_type: str, clause_l
     elif re.search(r"\bone[-\s]?quarter\b", clause_low):
         frac = "one_quarter"
 
-    # Keep only a small label signature (stable across primary vs exhibit text)
-    label_sig_bits: List[str] = []
-    for tok in ("make-whole", "make whole", "signing", "sign-on", "inducement", "replacement", "in lieu of", "annual"):
-        if tok in clause_low:
-            label_sig_bits.append(tok.replace(" ", "_"))
-    label_sig = ",".join(label_sig_bits)
-
-    return f"{bucket}|{amount_usd or ''}|{award_type}|{year_key}|{frac}|{label_sig}"
+    return f"{bucket}|{amount_usd or ''}|{award_type}|{frac}"
 
 
 def extract_compensation(text: str) -> ExtractedComp:
@@ -1514,7 +1560,7 @@ def extract_compensation(text: str) -> ExtractedComp:
     # ----
     # Classify $ amounts clause-by-clause (equity vs cash; one-time vs annual; pregrant/advance)
     # ----
-    clauses = re.split(r"(?<=[\.;])\s+", norm_ws(text))
+    clauses = split_clauses(text)
     seen_keys: Set[str] = set()
 
     def _add_equity(bucket: str, amt_str: str, amt_usd: Optional[int], award_type: str, clause: str, clause_low: str) -> None:
@@ -2048,7 +2094,7 @@ def process_filing(
                     continue
                 for m in re.finditer(re.escape(v), txt_norm, flags=re.IGNORECASE):
                     start = max(0, m.start() - 260)
-                    end = min(len(txt_norm), m.end() + 1600)
+                    end = min(len(txt_norm), m.end() + 2600)
                     win = txt_norm[start:end]
                     windows.append((_score_window(win), win))
 
@@ -2056,9 +2102,35 @@ def process_filing(
             if last:
                 for m in re.finditer(rf"\b(Mr\.|Ms\.|Mrs\.)\s+{re.escape(last)}\b", txt_norm, flags=re.IGNORECASE):
                     start = max(0, m.start() - 260)
-                    end = min(len(txt_norm), m.end() + 1600)
+                    end = min(len(txt_norm), m.end() + 2600)
                     win = txt_norm[start:end]
                     windows.append((_score_window(win), win))
+
+
+        # Also pick windows around common comp anchors (helps when biography text pushes salary/bonus out of a short name-window)
+        ANCHORS = (
+            r"\bemployment\s+agreement\b",
+            r"\boffer\s+letter\b",
+            r"\bpursuant\s+to\s+the\s+(?:employment\s+agreement|offer\s+letter)\b",
+            r"\bbase\s+salary\b",
+            r"\btarget\s+(?:cash\s+)?(?:bonus|incentive)\b",
+            r"\bannual\s+equity\s+award\b",
+            r"\btarget\s+grant\s+date\s+value\b",
+            r"\bgrant\s+date\s+value\b",
+        )
+        for _, txt2 in source_texts:
+            if not txt2:
+                continue
+            for ap in ANCHORS:
+                for m in re.finditer(ap, txt2, flags=re.IGNORECASE):
+                    start = max(0, m.start() - 340)
+                    end = min(len(txt2), m.end() + 2600)
+                    win = txt2[start:end]
+                    # Light relevance check: keep if we can see the target in the window
+                    if last and not re.search(rf"\b{re.escape(last)}\b", win, re.IGNORECASE):
+                        if core and not re.search(rf"\b{re.escape(core)}\b", win, re.IGNORECASE):
+                            continue
+                    windows.append((_score_window(win) + 1.5, win))
 
         # Pick top windows, then clamp length
         windows.sort(key=lambda x: x[0], reverse=True)
@@ -2074,6 +2146,7 @@ def process_filing(
             used_hashes.add(h)
             picked.append(nw)
         focus = "\n\n".join(picked)
+        focus = dedupe_clauses_text(focus)
         return focus[:18000]  # safety clamp
 
     HON_LAST_RE = re.compile(r"\b(Mr\.|Ms\.|Mrs\.|Dr\.)\s+([A-Z][A-Za-z\-’']+)\b")
@@ -2088,7 +2161,7 @@ def process_filing(
             return focus
         tl = target_last.lower()
 
-        clauses2 = re.split(r"(?<=[\.;])\s+", norm_ws(focus))
+        clauses2 = split_clauses(focus)
         current: Optional[str] = None
         kept: List[str] = []
 
@@ -2120,6 +2193,9 @@ def process_filing(
                 kept.append(cl)
 
         filtered = " ".join(kept).strip()
+
+        filtered = dedupe_clauses_text(filtered)
+
 
         # Fallback if over-filtered (keep original if we lost all money/context)
         if (("$" in focus) or ("us$" in focus.lower())) and not (("$" in filtered) or ("us$" in filtered.lower())):
