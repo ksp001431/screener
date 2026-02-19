@@ -365,17 +365,47 @@ def _unprotect_abbrev_periods(s: str) -> str:
     return s.replace(_ABBREV_DOT, ".")
 
 def split_clauses(text: str) -> List[str]:
-    """Split text into clauses on '.' and ';' while avoiding splits on common abbreviations (Mr., Ms., etc.)."""
+    """Split text into clause-like segments for compensation parsing.
+
+    We split on:
+      - sentence terminators (periods/semicolons)
+      - bullet markers (• and similar)
+      - list enumerators like (i), (ii), (iii) when they appear to introduce list items
+
+    This is intentionally conservative (we don't try to build perfect sentences) but it
+    materially reduces cross-contamination where adjacent bullets mention different pay
+    concepts (e.g., "No annual cash incentive" immediately followed by an equity award).
+    """
     if not text:
         return []
-    t = _protect_abbrev_periods(norm_ws(text))
-    parts = re.split(r"(?<=[\.;])\s+", t)
+
+    t = norm_ws(text)
+
+    # Normalize common bullet glyphs into hard breaks.
+    # Keep the enumerator tokens (e.g., "(i)") in place so downstream logic can use them.
+    t = re.sub(r"\s*[\u2022•·‣◦]\s*", ". ", t)
+
+    # Insert breaks before roman-numeral list items (i), (ii) ... when they look like list delimiters.
+    # Example patterns in 8-Ks: ": (i) ...; (ii) ..." or "will receive (i) ...".
+    t = re.sub(
+        r"\s+(?=\(\s*(?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv)\s*\)\s*)",
+        ". ",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    # Protect abbreviations, split, then unprotect.
+    t2 = _protect_abbrev_periods(t)
+    parts = re.split(r"(?<=[\.;])\s+", t2)
+
     out: List[str] = []
     for p in parts:
         p = _unprotect_abbrev_periods(p).strip()
-        if p:
-            out.append(p)
+        if not p:
+            continue
+        out.append(p)
     return out
+
 
 def dedupe_clauses_text(text: str) -> str:
     """Deduplicate repeated clauses (common when overlapping focus windows are concatenated)."""
@@ -1221,26 +1251,40 @@ def _compile_exec_regexes(position_titles: List[str]) -> List[re.Pattern]:
     title_re = rf"(?P<title>[^.;\n]{{0,100}}?\b(?:{title_alt})\b[^.;\n]{{0,100}}?)"
     verbs_alt = "|".join(APPOINT_VERBS)
 
+    # Allow an appositive after the executive name (common in 8-Ks), e.g., "Scott Boatwright, age 52,"
+    # or "Jane Doe, our former COO," so the name still matches.
+    name_app = rf"(?P<name>{NAME_RE})(?:\s*,[^.;\n]{{0,90}}?,)?"
+    other_name_app = rf"(?:{NAME_RE})(?:\s*,[^.;\n]{{0,90}}?,)?"
+
     patterns = [
         # "Jane Doe will succeed John Roe as Chief Financial Officer"
-        rf"(?P<name>{NAME_RE})\s+will\s+(?:succeed|replace)\s+(?:{NAME_RE})\s+as\s+(?:the\s+)?(?:its\s+)?{title_re}",
+        rf"{name_app}\s+will\s+(?:succeed|replace)\s+{other_name_app}\s+as\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "appointed John Doe as Chief Financial Officer"
-        rf"\b(?P<lemma>{verbs_alt})\b\s+(?P<name>{NAME_RE})\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
+        rf"\b(?P<lemma>{verbs_alt})\b\s+{name_app}\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe was appointed as Chief Financial Officer"
-        rf"(?P<name>{NAME_RE})\s+(?:has been|was|is)\s+\b(?P<lemma>{verbs_alt})\b\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
+        rf"{name_app}\s+(?:has been|was|is)\s+\b(?P<lemma>{verbs_alt})\b\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "the appointment of John Doe to serve as Chief Financial Officer"
-        rf"\bappointment\s+of\s+(?P<name>{NAME_RE})\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
+        rf"\bappointment\s+of\s+{name_app}\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe will serve as Chief Financial Officer"
-        rf"(?P<name>{NAME_RE})\s+will\s+(?:serve|act)\s+as\s+(?:the\s+)?(?:its\s+)?{title_re}",
+        rf"{name_app}\s+will\s+(?:serve|act)\s+as\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe will assume the role of Chief Financial Officer"
-        rf"(?P<name>{NAME_RE})\s+will\s+assum(?:e|ing)\s+(?:the\s+)?(?:role\s+of\s+)?{title_re}",
+        rf"{name_app}\s+will\s+assum(?:e|ing)\s+(?:the\s+)?(?:role\s+of\s+)?{title_re}",
     ]
     return [re.compile(p, flags=re.IGNORECASE) for p in patterns]
-def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str, Any], List[ExecMatch]]:
+def detect_exec_matches(
+    text: str,
+    position_query: str,
+    company_name: Optional[str] = None,
+) -> Tuple[bool, Dict[str, Any], List[ExecMatch]]:
     """
     Detect matches for the requested position in Item 5.02 context.
+
     Returns:
       detected_bool, details_dict, list_of_matches
+
+    Post-filters remove common false positives where the requested title is mentioned only
+    as a reporting line ("... reporting to the Chief Executive Officer") or as a subsidiary/
+    business-unit role ("CEO of the [Products] business").
     """
     canonical_pos, pos_titles = build_position_patterns(position_query)
 
@@ -1251,15 +1295,124 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
     regexes = _compile_exec_regexes(pos_titles)
     matches: List[ExecMatch] = []
 
+    # Helpers
+    def _trim_reporting_phrases(t: str) -> str:
+        if not t:
+            return t
+        # Drop trailing reporting relationships so the title reflects the appointed individual's role.
+        parts = re.split(r"\b(?:reporting\s+directly\s+to|reporting\s+to|reports?\s+to)\b", t, maxsplit=1, flags=re.IGNORECASE)
+        return parts[0].strip(" ,;:-")
+
+    def _title_hits_position(t: str) -> bool:
+        if not t:
+            return False
+        t_low = t.lower()
+        for tok in (pos_titles or []):
+            tok = (tok or "").strip()
+            if not tok:
+                continue
+            if len(tok) <= 4:
+                if re.search(rf"\b{re.escape(tok)}\b", t, re.IGNORECASE):
+                    return True
+            else:
+                if tok.lower() in t_low:
+                    return True
+        return False
+
+    def _is_subunit_role(t: str) -> bool:
+        # Filter subsidiary/business-unit CEOs/CFOs (e.g., "CEO of the Intel Products business").
+        if not t:
+            return False
+        t_low = t.lower()
+        if canonical_pos not in ("CEO", "CFO"):
+            return False
+        role_re = r"(?:chief\s+executive\s+officer|ceo)" if canonical_pos == "CEO" else r"(?:chief\s+financial\s+officer|cfo)"
+        m = re.search(rf"\b{role_re}\b\s+of\s+(?P<obj>[^,;\.\n]{{0,120}})", t_low)
+        if not m:
+            return False
+        obj = (m.group("obj") or "").strip()
+
+        # If the object phrase contains business-unit markers, treat as subunit even if the company name appears.
+        subunit_markers = (
+            "business",
+            "division",
+            "segment",
+            "unit",
+            "group",
+            "products",
+            "product",
+            "operations",
+            "region",
+            "americas",
+            "europe",
+            "asia",
+            "international",
+            "subsidiary",
+            "subsidiaries",
+            "platform",
+            "line of business",
+            "lob",
+        )
+        if any(k in obj for k in subunit_markers):
+            # Allow "of the Company"/"of [Company], Inc." style phrases.
+            if "company" in obj or "corporation" in obj or "inc" in obj or "incorporated" in obj:
+                return False
+            return True
+        return False
+
+    def _is_advisor_to_role(t: str) -> bool:
+        # Exclude "Advisor to the CEO" and similar constructs.
+        if not t:
+            return False
+        t_low = t.lower()
+        if canonical_pos != "CEO":
+            return False
+        return bool(
+            re.search(
+                r"\b(?:advisor|adviser|assistant|counsel|consultant)\b[^,;\.]{0,60}\bto\b[^,;\.]{0,60}\b(?:chief\s+executive\s+officer|ceo)\b",
+                t_low,
+            )
+        )
+
     for rx in regexes:
         for m in rx.finditer(item_text):
             name = norm_ws(m.group("name"))
-            title = norm_ws(m.group("title"))
+            title_raw = norm_ws(m.group("title"))
 
-            ctx = norm_ws(item_text[max(0, m.start()-260): m.end()+260])
-            is_interim = bool(re.search(r"\binterim\b", ctx, re.IGNORECASE))
+            # Clean title to avoid "reporting to CEO" pollution.
+            title = _trim_reporting_phrases(title_raw)
 
-            # effective date: first one in nearby context (prefer local)
+            # Post-filter: the cleaned title must still match the requested position.
+            if not _title_hits_position(title):
+                continue
+
+            # Post-filter: drop subunit CEO/CFO roles.
+            if _is_subunit_role(title):
+                continue
+
+            if _is_advisor_to_role(title):
+                continue
+
+            ctx = norm_ws(item_text[max(0, m.start() - 260) : m.end() + 260])
+
+            # Interim detection nuance:
+            # Some filings appoint an executive as a permanent CEO/CFO and then note they previously served in an interim capacity.
+            # We classify as an "interim" appointment only if "interim" modifies the appointed title (or appears in the immediate
+            # appointment clause), not merely as historical background ("has served as Interim ... since ...").
+            local = norm_ws(item_text[max(0, m.start() - 60) : min(len(item_text), m.end() + 160)])
+            prior_interim_service = bool(
+                re.search(
+                    r"\b(?:has|have|had|was|were)\s+(?:been\s+)?serv(?:ed|ing)\s+as\b[^.;]{0,180}\binterim\b",
+                    ctx,
+                    re.IGNORECASE,
+                )
+            )
+            interim_in_title = bool(re.search(r"\binterim\b", title, re.IGNORECASE))
+            interim_in_local = bool(re.search(r"\binterim\b", local, re.IGNORECASE))
+            # Treat as interim appointment only if interim is part of the appointed role, not just prior service.
+            is_interim = bool(interim_in_title or (interim_in_local and not prior_interim_service))
+
+            # effective date: first one in nearby context
             eff = None
             eff_m = EFFECTIVE_DATE_RE.search(ctx)
             if eff_m:
@@ -1268,6 +1421,9 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
             et = "unknown"
             if is_interim:
                 et = "interim"
+            elif prior_interim_service:
+                # Appointed to the role after serving in an interim capacity (not itself an interim appointment)
+                et = "interim_to_permanent"
             elif re.search(r"\bpromot(?:ed|ion)\b", ctx, re.IGNORECASE):
                 et = "promotion"
             elif re.search(r"\b(hire(?:d)?|join(?:ed|ing))\b", ctx, re.IGNORECASE):
@@ -1306,7 +1462,7 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
             if not tok:
                 continue
             if len(tok) <= 4:  # likely acronym
-                if re.search(rf"\\b{re.escape(tok)}\\b", t or "", re.IGNORECASE):
+                if re.search(rf"\b{re.escape(tok)}\b", t or "", re.IGNORECASE):
                     score = max(score, 100 - i * 10)
             else:
                 if tok.lower() in t_low:
@@ -1337,7 +1493,7 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
         for mm in uniq:
             tl = (mm.title or "")
             if any(
-                (re.search(rf"\\b{re.escape(tok)}\\b", tl, re.IGNORECASE) if len(tok) <= 4 else tok.lower() in tl.lower())
+                (re.search(rf"\b{re.escape(tok)}\b", tl, re.IGNORECASE) if len(tok) <= 4 else tok.lower() in tl.lower())
                 for tok in high_tokens
                 if tok
             ):
@@ -1396,49 +1552,42 @@ BASE_SALARY_PATTERNS: List[re.Pattern] = [
 ]
 
 # Target bonus / annual incentive patterns
-TARGET_BONUS_PCT_PATTERNS: List[re.Pattern] = [
-    # "target annual incentive bonus of no less than 150% of his base salary"
+TARGET_BONUS_PCT_PATTERNS = [
+    # Common: "annual ... cash bonus ... target payout/value/opportunity of 200% of base salary"
     re.compile(
-        r"\btarget\s+annual\s+(?:cash\s+)?(?:incentive\s+)?bonus\b"
-        r"[^.:\n]{0,220}?\b(?:of|at|equal\s+to)\b"
-        r"[^.:\n]{0,80}?(?:no\s+less\s+than|at\s+least)?\s*(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^.:\n]{0,180}?\bof\b[^.:\n]{0,80}?\b(?:his|her|the)?\s*(?:annual\s+)?base\s+salary\b",
+        r"\b(?:annual\s+(?:incentive\s+)?(?:cash\s+)?(?:bonus|incentive)|target\s+(?:annual\s+)?(?:cash\s+)?(?:bonus|incentive))\b"
+        r"[^\n]{0,450}?\b(?:target\s+(?:payout|value|opportunity)\s+of|with\s+a\s+target\s+(?:payout|value|opportunity)\s+of|target(?:ed)?\s+at|equal\s+to|set\s+at|at\s+a\s+target\s+of)\b"
+        r"[^\n]{0,650}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^\n]{0,300}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
         re.IGNORECASE,
     ),
-    # "annual cash incentive opportunity at a target of 150% of base salary"
+    # "annual cash incentive award ... with a target value/payout of 275% of base salary"
     re.compile(
-        r"\b(?:annual\s+cash\s+incentive|annual\s+incentive|cash\s+incentive|bonus\s+opportunity|short-?term\s+incentive)\b"
-        r"[^.:\n]{0,220}?\b(?:at\s+a\s+target\s+of|target(?:ed)?\s+of|equal\s+to|set\s+at|with\s+a\s+target\s+of)\b"
-        r"[^.:\n]{0,80}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^.:\n]{0,120}?\bof\b[^.:\n]{0,40}?\bbase\s+salary\b",
+        r"\bannual\s+cash\s+incentive\s+award\b"
+        r"[^\n]{0,700}?\b(?:target\s+(?:payout|value|opportunity)\s+of|with\s+a\s+target\s+(?:payout|value|opportunity)\s+of|target(?:ed)?\s+at|equal\s+to|set\s+at|at\s+a\s+target\s+of)\b"
+        r"[^\n]{0,700}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^\n]{0,320}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
         re.IGNORECASE,
     ),
-    # "target award ... equal to 160% of base salary"
+    # "Short Term Incentive Plan/short-term cash incentive ... targeted at ... 250% of base salary"
     re.compile(
-        r"\btarget\s+award\b[^.:\n]{0,160}?\b(?:equal\s+to|at|of)\b[^.:\n]{0,80}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^.:\n]{0,120}?\bof\b[^.:\n]{0,40}?\bbase\s+salary\b",
+        r"\b(?:short\s*(?:-|\s)?term\s+(?:cash\s+)?incentive(?:\s+plan)?|sti\b)\b"
+        r"[^\n]{0,1800}?\btarget(?:ed)?\b"
+        r"[^\n]{0,1800}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^\n]{0,320}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
         re.IGNORECASE,
     ),
-    # "at target, 120% of base salary"
+    # "target incentive opportunity ... equal to 250% of base salary"
     re.compile(
-        r"\bat\s+target\b[^.:\n]{0,80}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:his|her|the)\s+base\s+salary",
-        re.IGNORECASE,
-    ),
-# "target incentive opportunity of 200% of base salary" / "annual target bonus opportunity of 200% of annual base salary"
-re.compile(
-    r"\b(?:target\s+(?:incentive|bonus)\s+opportunity|annual\s+target\s+bonus\s+opportunity|annual\s+bonus\s+opportunity)\b"
-    r"[^.:\n]{0,160}?\b(?:of|at)\b[^.:\n]{0,40}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-    r"[^.:\n]{0,180}?\bof\b[^.:\n]{0,60}?\b(?:annual\s+)?base\s+salary\b",
-    re.IGNORECASE,
-),
-
-    # "annual target cash bonus equal to 200% of his/her base salary" (FactSet-style wording)
-    re.compile(
-        r"\b(?:annual\s+)?target\s+(?:cash\s+)?bonus\b[^.:\n]{0,220}?\b(?:equal\s+to|of|at)\b[^.:\n]{0,80}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^.:\n]{0,140}?\bof\b[^.:\n]{0,80}?\b(?:his|her|the)?\s*base\s+salary\b",
+        r"\btarget\s+(?:incentive|bonus)\s+opportunity\b"
+        r"[^\n]{0,500}?\b(?:equal\s+to|of|at|set\s+at)\b"
+        r"[^\n]{0,400}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^\n]{0,260}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
         re.IGNORECASE,
     ),
 ]
+
+
 
 TARGET_BONUS_USD_PATTERNS: List[re.Pattern] = [
     # "target short-term incentive $3,250,000"
@@ -1465,17 +1614,32 @@ EQUITY_KWS = (
     "long term incentive",
     "lti",
     "ltip",
+    "long-term incentive equity",
     "restricted stock",
     "restricted stock unit",
-    "rsu",
+    "restricted stock units",
+    "stock unit",
+    "stock units",
+    "performance stock unit",
+    "performance stock units",
     "performance share",
     "psu",
+    "psus",
+    "rsu",
+    "rsus",
+    "pbrsu",
+    "performance-based restricted stock unit",
+    "performance-based restricted stock units",
+    "performance based restricted stock unit",
+    "performance based restricted stock units",
     "stock option",
-    "options",
+    "stock options",
     "option",
+    "options",
     "grant date",
     "grant-date",
 )
+
 
 CASH_KWS = (
     "cash",
@@ -1655,7 +1819,7 @@ def _infer_award_types_for_clause(clause: str, money_matches: List[re.Match]) ->
     # Fallback: per-amount local context
     out: List[str] = []
     for mm in money_matches:
-        local = clause[max(0, mm.start() - 90) : min(len(clause), mm.end() + 90)].lower()
+        local = clause[max(0, mm.start() - 220) : min(len(clause), mm.end() + 220)].lower()
         out.append(_infer_award_type(local))
     return out
 
@@ -1745,7 +1909,7 @@ def _equity_bucket_for_context(clause_low: str, local_low: str) -> str:
 
     # One-time signals are split into strong vs weak so that phrases like "initial annual equity award"
     # don't get incorrectly bucketed as one-time purely due to the word "initial".
-    one_time_strong_kws = ("one-time", "one time", "sign-on", "sign on", "signing", "make-whole", "make whole", "inducement", "replacement", "makewhole")
+    one_time_strong_kws = ("one-time", "one time", "sign-on", "sign on", "signing", "make-whole", "make whole", "inducement", "replacement", "makewhole", "new hire", "new-hire")
     one_time_weak_kws = ("new hire", "commencement", "start date", "promptly following", "on or promptly following", "join the company", "to join", "to incentivize", "to induce", "in connection with", "upon joining", "initial", "special")
 
     one_time_strong = any(k in local_low for k in one_time_strong_kws)
@@ -1799,15 +1963,21 @@ def extract_compensation(text: str) -> ExtractedComp:
     """
     Heuristic extraction of salary, target bonus, and equity/cash award values from text.
 
-    Key upgrades vs earlier versions:
-      - Classifies each $ amount using LOCAL context (prevents 'make-whole RSU' being recorded as cash).
-      - Preserves distinct awards that share the same $ value (PayPal 16.5M RSU + 16.5M PSU).
+    Key behaviors:
+      - Classifies each $ amount using LOCAL context (reduces false cash/equity attribution).
+      - Preserves distinct awards that share the same $ value (e.g., RSU + PSU with same target).
       - Avoids double-counting aggregates when an aggregate + components are both disclosed in the same clause.
-      - Excludes conditional subset amounts (FactSet '$10M subject to repayment' inside a $13M payment).
+      - Excludes conditional subset amounts (e.g., "$13 million, $10 million of which is subject to repayment").
+      - Tracks section-level equity context (e.g., "New Hire Equity Awards" vs "Long-Term Incentive Equity Awards"),
+        which is critical when award clauses only use valuation phrases ("grant date value") without explicit one-time/annual words.
     """
     comp = ExtractedComp()
     if not text:
         return comp
+
+    # Filter out tiny dollar amounts (par value, nominal fees) that frequently appear in 8-K cover pages
+    # and can pollute totals.
+    MIN_COMP_AMOUNT_USD = 10_000
 
     # ----
     # Base salary
@@ -1824,14 +1994,54 @@ def extract_compensation(text: str) -> ExtractedComp:
     # ----
     # Target bonus (percent or $)
     # ----
+    best_pct_m = None
     for pat in TARGET_BONUS_PCT_PATTERNS:
         m = pat.search(text)
         if m:
+            best_pct_m = m
+            break
+
+    # Fallback: pick the best "% of base salary" that looks like a target bonus (handles long parenthetical pro-rating).
+    if best_pct_m is None:
+        pct_of_base_re = re.compile(
+            r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%\s+of\s+[^\n]{0,90}?\b(?:annual\s+)?base\s+salary\b",
+            re.IGNORECASE,
+        )
+        best_score = -1e9
+        for m in pct_of_base_re.finditer(text):
             pct = m.group("pct")
+            try:
+                pct_v = float(pct)
+            except Exception:
+                continue
+            # context window BEFORE the percent is the most informative
+            w0 = max(0, m.start() - 450)
+            w1 = min(len(text), m.start() + 80)
+            ctx_low = text[w0:w1].lower()
+
+            score = 0.0
+            if any(k in ctx_low for k in ("bonus", "incentive", "sti", "short term", "short-term", "annual performance bonus")):
+                score += 2.0
+            if "target" in ctx_low or "targeted" in ctx_low:
+                score += 1.0
+            if any(k in ctx_low for k in ("maximum", "max", "cap")):
+                score -= 0.5
+            # Prefer plausible executive target ranges (but don't hard-filter).
+            if 50.0 <= pct_v <= 400.0:
+                score += 0.5
+
+            if score > best_score:
+                best_score = score
+                best_pct_m = m
+
+    if best_pct_m is not None:
+        pct = best_pct_m.group("pct")
+        try:
             comp.target_bonus_pct = float(pct)
             comp.target_bonus = f"{pct}%"
-            comp.evidence_snippets.append(sentence_snippet(text, m.start(), m.end()))
-            break
+        except Exception:
+            pass
+        comp.evidence_snippets.append(sentence_snippet(text, best_pct_m.start(), best_pct_m.end()))
 
     if comp.target_bonus is None:
         for pat in TARGET_BONUS_USD_PATTERNS:
@@ -1858,6 +2068,10 @@ def extract_compensation(text: str) -> ExtractedComp:
     # ----
     clauses = split_clauses(text)
     seen_keys: Set[str] = set()
+
+    # Section-level equity context (persist across adjacent clauses / bullets)
+    equity_mode: Optional[str] = None   # "annual" | "one_time" | None
+    no_annual_equity: bool = False
 
     def _add_equity(bucket: str, amt_str: str, amt_usd: Optional[int], award_type: str, clause: str, clause_low: str) -> None:
         key = _money_key(bucket, amt_usd, award_type, clause_low)
@@ -1896,7 +2110,6 @@ def extract_compensation(text: str) -> ExtractedComp:
                 comp.equity_uncertain_values_usd.append(amt_usd)
             comp.equity_uncertain_details.append(clause[:420])
 
-
     def _add_cash(amt_str: str, amt_usd: Optional[int], clause: str, clause_low: str) -> None:
         key = _money_key("one_time_cash", amt_usd, "cash", clause_low)
         if key in seen_keys:
@@ -1908,9 +2121,40 @@ def extract_compensation(text: str) -> ExtractedComp:
         comp.one_time_cash_details.append(clause[:420])
 
     for clause in clauses:
-        if not clause or len(clause) < 40:
+        if not clause:
             continue
         clause_low = clause.lower()
+
+        # Update equity section context
+        if re.search(r"\bno\s+(?:additional\s+)?annual\s+equity\s+awards?\b", clause_low):
+            no_annual_equity = True
+
+        if "exclusive long-term incentive" in clause_low and ("during the term" in clause_low or "employment term" in clause_low):
+            equity_mode = "one_time"
+            no_annual_equity = True
+
+        if re.search(r"\bnew\s*(?:-|\s)?hire\s+equity\s+awards?\b", clause_low):
+            equity_mode = "one_time"
+
+        # Some filings separate the heading ("New Hire Equity Awards") from the award bullets.
+        # If we see "new hire" alongside equity language, treat subsequent awards as one-time.
+        if re.search(r"\bnew\s*(?:-|\s)?hire\b", clause_low) and _contains_any(clause_low, EQUITY_KWS):
+            equity_mode = "one_time"
+
+        if "inducement" in clause_low and ("award" in clause_low or "grant" in clause_low):
+            equity_mode = "one_time"
+        if ("sign-on" in clause_low or "sign on" in clause_low or "make-whole" in clause_low or "make whole" in clause_low) and ("award" in clause_low or "grant" in clause_low or "equity" in clause_low):
+            equity_mode = "one_time"
+
+        if re.search(r"\blong\s*(?:-|\s)?term\s+incentive\s+equity\s+awards?\b", clause_low):
+            equity_mode = "annual"
+
+        # If a clause explicitly discusses "annual long-term incentive ... target value", treat as annual.
+        if re.search(r"\bannual\s+long\s*(?:-|\s)?term\s+incentive\b", clause_low) or re.search(r"\bannual\s+long\s*(?:-|\s)?term\s+incentive\s+equity\s+award\b", clause_low):
+            equity_mode = "annual"
+
+        if len(clause) < 30:
+            continue
 
         money_matches = list(MONEY_FIND_RE.finditer(clause))
         if not money_matches:
@@ -1924,11 +2168,18 @@ def extract_compensation(text: str) -> ExtractedComp:
             amt_str = _canonical_money_str(amt_raw)
             amt_usd = money_to_usd(amt_str)
 
-            local = clause[max(0, mm.start() - 90) : min(len(clause), mm.end() + 90)]
-            local_low = local.lower()
+            if amt_usd is not None and amt_usd < MIN_COMP_AMOUNT_USD:
+                continue
 
             if _is_subset_amount(clause, mm):
                 continue
+
+            # Context windows
+            local_wide = clause[max(0, mm.start() - 220) : min(len(clause), mm.end() + 220)]
+            local_wide_low = local_wide.lower()
+
+            local_tight = clause[max(0, mm.start() - 70) : min(len(clause), mm.end() + 70)]
+            local_tight_low = local_tight.lower()
 
             # Tight window used to identify base salary mentions (avoid misclassifying salary as equity
             # when equity awards are described nearby in the same sentence).
@@ -1936,18 +2187,22 @@ def extract_compensation(text: str) -> ExtractedComp:
             near_low = near.lower()
             salary_near = bool(re.search(r"\b(base\s+salary|salary)\b", near_low))
 
-            equity_near = _contains_any(local_low, EQUITY_KWS)
-            cash_near = _contains_any(local_low, CASH_KWS)
-            one_time_near = _contains_any(local_low, ONE_TIME_KWS)
-            cash_strong_near = bool(re.search(r"\bcash\s+(?:payment|bonus|award|retention|incentive)\b", local_low))
+            equity_near = _contains_any(local_wide_low, EQUITY_KWS)
+            # cash keywords should be tight to avoid cross-contamination
+            cash_near = _contains_any(local_tight_low, CASH_KWS)
+            one_time_near = _contains_any(local_wide_low, ONE_TIME_KWS)
 
-            award_type = award_types[i] if i < len(award_types) else _infer_award_type(local_low)
+            cash_strong_near = bool(
+                re.search(r"\bcash\s+(?:payment|bonus|award|retention|incentive)\b", local_tight_low)
+            )
+
+            award_type = award_types[i] if i < len(award_types) else _infer_award_type(local_wide_low)
 
             mentions.append(
                 {
                     "amt_str": amt_str,
                     "amt_usd": amt_usd,
-                    "local_low": local_low,
+                    "local_low": local_wide_low,
                     "equity_near": equity_near,
                     "cash_near": cash_near,
                     "one_time_near": one_time_near,
@@ -1987,20 +2242,34 @@ def extract_compensation(text: str) -> ExtractedComp:
             award_type = mn["award_type"]
 
             if mn.get("salary_near"):
-                # Base salary is handled separately; also prevents misclassifying salary as equity when an
-                # equity award is mentioned nearby in the same clause.
                 continue
 
             # One-time cash payments: prioritize explicit "cash payment/bonus/award" even if the clause also
             # discusses equity (common in make-whole / inducement clauses).
             if mn.get("cash_strong_near") and mn.get("one_time_near") and mn.get("cash_near"):
                 _add_cash(amt_str, amt_usd, clause, clause_low)
+                comp.evidence_snippets.append(clause[:420])
                 continue
 
             # Equity if equity keywords near the amount (preferred)
             if mn["equity_near"]:
                 bucket_ctx_low = clause_low if len(money_matches) == 1 else local_low
+
+                # Inject section-level hints (so "grant date value" doesn't default to "uncertain")
+                if equity_mode == "annual":
+                    bucket_ctx_low += " annual long-term incentive eligible annual equity award"
+                elif equity_mode == "one_time":
+                    bucket_ctx_low += " one-time new hire sign-on inducement make-whole initial"
+
+                if no_annual_equity:
+                    bucket_ctx_low += " no annual equity awards exclusive long-term incentive during the term"
+
                 bucket = _equity_bucket_for_context(clause_low, bucket_ctx_low)
+
+                # If the filing explicitly states there will be no annual equity awards, treat equity as one-time.
+                if no_annual_equity and bucket in ("annual_target", "annual_advance", "annual_pregrant", "uncertain"):
+                    bucket = "one_time"
+
                 _add_equity(bucket, amt_str, amt_usd, award_type, clause, clause_low)
                 comp.equity_awards.append(clause[:420])
                 comp.evidence_snippets.append(clause[:420])
@@ -2075,7 +2344,6 @@ def extract_compensation(text: str) -> ExtractedComp:
     comp.equity_uncertain_usd_total = int(sum(comp.equity_uncertain_values_usd)) if comp.equity_uncertain_values_usd else None
 
     if (
-
         comp.equity_target_annual_usd_total is not None
         or comp.equity_one_time_usd_total is not None
         or comp.equity_annual_advance_usd_total is not None
@@ -2103,9 +2371,6 @@ def extract_compensation(text: str) -> ExtractedComp:
             pass
 
     return comp
-
-
-
 
 
 def compensation_brief(comp: "ExtractedComp") -> str:
