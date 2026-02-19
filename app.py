@@ -23,7 +23,7 @@ st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
 CACHE_DIR = Path(".cache_edgar")
-SCANNER = Path("exec_8k_scanner_v7_5.py")
+SCANNER = Path("exec_8k_scanner.py")
 
 
 # ----------
