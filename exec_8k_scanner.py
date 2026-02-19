@@ -1264,7 +1264,7 @@ def _compile_exec_regexes(position_titles: List[str]) -> List[re.Pattern]:
         # "John Doe was appointed as Chief Financial Officer"
         rf"{name_app}\s+(?:has been|was|is)\s+\b(?P<lemma>{verbs_alt})\b\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "the appointment of John Doe to serve as Chief Financial Officer"
-        rf"\bappointment\s+of\s+{name_app}\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
+        rf"\b(?:the|an|this)\s+appointment\s+of\s+{name_app}\s+(?:as|to serve as|to be)\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe will serve as Chief Financial Officer"
         rf"{name_app}\s+will\s+(?:serve|act)\s+as\s+(?:the\s+)?(?:its\s+)?{title_re}",
         # "John Doe will assume the role of Chief Financial Officer"
@@ -1282,9 +1282,14 @@ def detect_exec_matches(
     Returns:
       detected_bool, details_dict, list_of_matches
 
-    Post-filters remove common false positives where the requested title is mentioned only
-    as a reporting line ("... reporting to the Chief Executive Officer") or as a subsidiary/
-    business-unit role ("CEO of the [Products] business").
+    Precision safeguards:
+      - Require an appointment-style pattern (regexes are anchored to common appointment language).
+      - Post-filter out reporting-line mentions ("... reporting to the CEO").
+      - Post-filter out subsidiary / segment / division / business-unit CEO/CFO roles.
+
+    NOTE: We apply false-positive filters on the *raw matched title snippet* (before display-normalization),
+    because the normalized title often removes important context like "of its [segment]" that we need to
+    correctly exclude subunit roles.
     """
     canonical_pos, pos_titles = build_position_patterns(position_query)
 
@@ -1300,7 +1305,12 @@ def detect_exec_matches(
         if not t:
             return t
         # Drop trailing reporting relationships so the title reflects the appointed individual's role.
-        parts = re.split(r"\b(?:reporting\s+directly\s+to|reporting\s+to|reports?\s+to)\b", t, maxsplit=1, flags=re.IGNORECASE)
+        parts = re.split(
+            r"\b(?:reporting\s+directly\s+to|reporting\s+to|reports?\s+to)\b",
+            t,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )
         return parts[0].strip(" ,;:-")
 
     def _title_hits_position(t: str) -> bool:
@@ -1319,95 +1329,242 @@ def detect_exec_matches(
                     return True
         return False
 
-    def _is_subunit_role(t: str) -> bool:
-        # Filter subsidiary/business-unit CEOs/CFOs (e.g., "CEO of the Intel Products business").
-        if not t:
+    _BAD_NAME_WORDS = {
+        # Table headings / boilerplate that frequently get mis-captured as "names"
+        "name",
+        "position",
+        "title",
+        "current",
+        "target",
+        "award",
+        "awards",
+        "incentive",
+        "plan",
+        "committee",
+        "board",
+        "director",
+        "directors",
+        "officer",
+        "officers",
+        "percentage",
+        "base",
+        "salary",
+        "tip",
+        "sti",
+        "lti",
+        "ltip",
+        "payout",
+        "structure",
+        "table",
+    }
+
+    def _looks_like_person_name(n: str) -> bool:
+        if not n:
             return False
-        t_low = t.lower()
+        n2 = re.sub(r"^(?:Mr\.|Ms\.|Mrs\.|Dr\.)\s+", "", n.strip(), flags=re.IGNORECASE)
+        if re.search(r"\d", n2):
+            return False
+        toks = [re.sub(r"[^A-Za-z’'\-]", "", t) for t in n2.split()]
+        toks = [t for t in toks if t]
+        if len(toks) < 2:
+            return False
+        # Reject if any token is clearly a table header / boilerplate word.
+        if any(t.lower() in _BAD_NAME_WORDS for t in toks):
+            return False
+        # Reject if the name is dominated by short all-caps tokens (e.g., "TIP", "LTI") - usually not a person.
+        caps_short = [t for t in toks if t.isupper() and len(t) <= 4]
+        if len(caps_short) >= max(2, len(toks) - 1):
+            return False
+        return True
+
+    # Pre-compute company tokens for optional company-name similarity checks
+    def _sig_company_tokens(cn: Optional[str]) -> List[str]:
+        if not cn:
+            return []
+        s = cn.lower()
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        suffix = {
+            "inc",
+            "incorporated",
+            "corp",
+            "corporation",
+            "co",
+            "company",
+            "ltd",
+            "limited",
+            "plc",
+            "llc",
+            "lp",
+            "l",
+            "p",
+            "holdings",
+            "holding",
+            "the",
+        }
+        toks = [t for t in s.split() if t and t not in suffix and len(t) >= 3]
+        # Keep a small set; first tokens are usually most distinctive
+        return toks[:5]
+
+    _company_toks = set(_sig_company_tokens(company_name))
+
+    def _obj_mentions_company(obj_phrase: str) -> bool:
+        if not obj_phrase or not _company_toks:
+            return False
+        s = obj_phrase.lower()
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        toks = set([t for t in s.split() if t and len(t) >= 3])
+        overlap = len(toks & _company_toks)
+        if not _company_toks:
+            return False
+        # Require >=2 overlaps for multi-token company names, else >=1 for single-token names
+        req = 1 if len(_company_toks) <= 1 else 2
+        return overlap >= req
+
+    def _is_subunit_role(title_raw: str, ctx_raw: str) -> bool:
+        """
+        Filter subsidiary / segment / division / business-unit CEO/CFO roles.
+
+        Key design: prefer *strong* subunit signals (segment/division/business/subsidiary/standalone/spin-off)
+        so we don't accidentally drop true company-level CEO/CFO appointments for companies whose names
+        contain words like "Group" or "International".
+        """
+        if not title_raw:
+            return False
         if canonical_pos not in ("CEO", "CFO"):
             return False
-        role_re = r"(?:chief\s+executive\s+officer|ceo)" if canonical_pos == "CEO" else r"(?:chief\s+financial\s+officer|cfo)"
-        m = re.search(rf"\b{role_re}\b\s+of\s+(?P<obj>[^,;\.\n]{{0,120}})", t_low)
-        if not m:
-            return False
-        obj = (m.group("obj") or "").strip()
 
-        # If the object phrase contains business-unit markers, treat as subunit even if the company name appears.
-        subunit_markers = (
-            "business",
-            "division",
-            "segment",
-            "unit",
-            "group",
-            "products",
-            "product",
-            "operations",
-            "region",
-            "americas",
-            "europe",
-            "asia",
-            "international",
-            "subsidiary",
-            "subsidiaries",
-            "platform",
-            "line of business",
-            "lob",
+        t_low = title_raw.lower()
+        ctx_low = (ctx_raw or "").lower()
+
+        hay = t_low + " " + ctx_low
+
+        role_re = r"(?:chief\s+executive\s+officer|ceo)" if canonical_pos == "CEO" else r"(?:chief\s+financial\s+officer|cfo)"
+
+        # Common "CEO/CFO of X" construct
+        m = re.search(rf"\b{role_re}\b\s+of\s+(?P<obj>[^,;\.\n]{{0,180}})", hay)
+        if m:
+            obj = (m.group("obj") or "").strip()
+
+            # Allow true company-level phrasing.
+            if re.match(r"^(?:the\s+)?(?:company|corporation|registrant|issuer)\b", obj):
+                return False
+
+            # If the object includes corporate suffix words, treat as likely company-level.
+            if re.search(r"\b(company|co\b|corp\b|corporation|inc\b|incorporated|ltd\b|limited|plc\b|llc\b)\b", obj):
+                return False
+
+            strong_terms = (
+                "segment",
+                "division",
+                "business unit",
+                "business",
+                "unit",
+                "subsidiary",
+                "subsidiaries",
+                "standalone business",
+                "stand-alone business",
+                "platform",
+                "line of business",
+                "lob",
+                "product business",
+                "products business",
+            )
+            spinoff_terms = (
+                "spin-off",
+                "spinoff",
+                "spin off",
+                "split-off",
+                "split off",
+                "carve-out",
+                "carve out",
+                "separation",
+                "standalone",
+                "stand-alone",
+            )
+
+            # Strong subunit cues in the object phrase itself
+            if any(term in obj for term in strong_terms):
+                return True
+
+            # Strong subunit cues in the nearby clause/context (covers cases like "..., an Intel standalone business")
+            if any(term in ctx_low for term in strong_terms):
+                return True
+
+            # Spin-off / separation cues are a strong indicator the role is not for the registrant.
+            if any(term in ctx_low for term in spinoff_terms) or any(term in t_low for term in spinoff_terms):
+                return True
+
+            # If the object phrase doesn't plausibly refer to the registrant and the context says "subsidiary", treat as subunit.
+            if not _obj_mentions_company(obj) and re.search(r"\bsubsidiar(?:y|ies)\b", ctx_low):
+                return True
+
+            return False
+
+        # Alternate construct: "to the position of CEO X" (e.g., "CEO PMI International")
+        m2 = re.search(
+            rf"\b(?:position|role)\b[^.;\n]{{0,80}}?\bof\b[^.;\n]{{0,40}}?\b{role_re}\b\s+(?P<obj>[^,;\.\n]{{1,90}})",
+            hay,
         )
-        if any(k in obj for k in subunit_markers):
-            # Allow "of the Company"/"of [Company], Inc." style phrases.
-            if "company" in obj or "corporation" in obj or "inc" in obj or "incorporated" in obj:
+        if m2:
+            obj = (m2.group("obj") or "").strip()
+            if re.match(r"^(?:the\s+)?(?:company|corporation|registrant|issuer)\b", obj):
+                return False
+            if re.search(r"\b(company|corp\b|corporation|inc\b|incorporated|ltd\b|limited|plc\b|llc\b)\b", obj):
+                return False
+            # If it clearly points to the registrant (name overlap), keep it.
+            if _obj_mentions_company(obj):
                 return False
             return True
+
         return False
 
     def _is_advisor_to_role(t: str) -> bool:
         # Exclude "Advisor to the CEO" and similar constructs.
         if not t:
             return False
-        t_low = t.lower()
         if canonical_pos != "CEO":
             return False
         return bool(
             re.search(
-                r"\b(?:advisor|adviser|assistant|counsel|consultant)\b[^,;\.]{0,60}\bto\b[^,;\.]{0,60}\b(?:chief\s+executive\s+officer|ceo)\b",
-                t_low,
+                r"\b(?:advisor|adviser|assistant|counsel|consultant)\b[^,;\.]{{0,60}}\bto\b[^,;\.]{{0,60}}\b(?:chief\s+executive\s+officer|ceo)\b",
+                t.lower(),
             )
         )
 
     for rx in regexes:
         for m in rx.finditer(item_text):
             name = norm_ws(m.group("name"))
+            if not _looks_like_person_name(name):
+                continue
+
             title_raw = norm_ws(m.group("title"))
+            title_for_filter = _trim_reporting_phrases(title_raw)
 
-            # Clean title to avoid "reporting to CEO" pollution.
-            title = _trim_reporting_phrases(title_raw)
-
-            # Post-filter: the cleaned title must still match the requested position.
-            if not _title_hits_position(title):
-                continue
-
-            # Post-filter: drop subunit CEO/CFO roles.
-            if _is_subunit_role(title):
-                continue
-
-            if _is_advisor_to_role(title):
-                continue
-
+            # Grab nearby context early so filters can use it.
             ctx = norm_ws(item_text[max(0, m.start() - 260) : m.end() + 260])
 
+            # Post-filter: the raw title must still match the requested position.
+            if not _title_hits_position(title_for_filter):
+                continue
+
+            # Post-filter: drop subsidiary/segment/business-unit roles.
+            if _is_subunit_role(title_for_filter, ctx):
+                continue
+
+            # Post-filter: drop advisor-to-CEO roles.
+            if _is_advisor_to_role(title_for_filter):
+                continue
+
             # Interim detection nuance:
-            # Some filings appoint an executive as a permanent CEO/CFO and then note they previously served in an interim capacity.
-            # We classify as an "interim" appointment only if "interim" modifies the appointed title (or appears in the immediate
-            # appointment clause), not merely as historical background ("has served as Interim ... since ...").
             local = norm_ws(item_text[max(0, m.start() - 60) : min(len(item_text), m.end() + 160)])
             prior_interim_service = bool(
                 re.search(
-                    r"\b(?:has|have|had|was|were)\s+(?:been\s+)?serv(?:ed|ing)\s+as\b[^.;]{0,180}\binterim\b",
+                    r"\b(?:has|have|had|was|were)\s+(?:been\s+)?serv(?:ed|ing)\s+as\b[^.;]{{0,180}}\binterim\b",
                     ctx,
                     re.IGNORECASE,
                 )
             )
-            interim_in_title = bool(re.search(r"\binterim\b", title, re.IGNORECASE))
+            interim_in_title = bool(re.search(r"\binterim\b", title_for_filter, re.IGNORECASE))
             interim_in_local = bool(re.search(r"\binterim\b", local, re.IGNORECASE))
             # Treat as interim appointment only if interim is part of the appointed role, not just prior service.
             is_interim = bool(interim_in_title or (interim_in_local and not prior_interim_service))
@@ -1422,17 +1579,18 @@ def detect_exec_matches(
             if is_interim:
                 et = "interim"
             elif prior_interim_service:
-                # Appointed to the role after serving in an interim capacity (not itself an interim appointment)
                 et = "interim_to_permanent"
             elif re.search(r"\bpromot(?:ed|ion)\b", ctx, re.IGNORECASE):
                 et = "promotion"
             elif re.search(r"\b(hire(?:d)?|join(?:ed|ing))\b", ctx, re.IGNORECASE):
                 et = "hire"
 
+            display_title = normalize_position_title(title_for_filter, position_query, is_interim=is_interim)
+
             matches.append(
                 ExecMatch(
                     name=name,
-                    title=title,
+                    title=display_title,
                     context=ctx,
                     is_interim=is_interim,
                     event_type=et,
@@ -1528,178 +1686,6 @@ def detect_exec_matches(
         details["examples"] = [dataclasses.asdict(deduped[0])]
 
     return detected, details, deduped
-
-
-# -----------------------------
-# Compensation extraction (heuristic)
-# -----------------------------
-
-# IMPORTANT: Require a word boundary after short scale abbreviations (m/b/k/bn) to avoid
-# mis-parsing phrases like "$1,000,003 make-whole" as "$1,000,003 million".
-DOLLAR_RE = (
-    r"(?:US\$|[$€£])\s*"
-    r"(?:\d{1,3}(?:,\d{3})+|\d+)"
-    r"(?:\.\d+)?"
-    r"(?:\s*(?:million|billion|thousand|m|bn|b|k)\b)?"
-)
-
-MONEY_FIND_RE = re.compile(DOLLAR_RE, flags=re.IGNORECASE)
-
-# Core comp patterns (salary / bonus)
-BASE_SALARY_PATTERNS: List[re.Pattern] = [
-    re.compile(rf"\b(?:annual\s+)?base\s+salary\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE),
-    re.compile(rf"\b(?:annual\s+)?salary\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE),
-]
-
-# Target bonus / annual incentive patterns
-TARGET_BONUS_PCT_PATTERNS = [
-    # Common: "annual ... cash bonus ... target payout/value/opportunity of 200% of base salary"
-    re.compile(
-        r"\b(?:annual\s+(?:incentive\s+)?(?:cash\s+)?(?:bonus|incentive)|target\s+(?:annual\s+)?(?:cash\s+)?(?:bonus|incentive))\b"
-        r"[^\n]{0,450}?\b(?:target\s+(?:payout|value|opportunity)\s+of|with\s+a\s+target\s+(?:payout|value|opportunity)\s+of|target(?:ed)?\s+at|equal\s+to|set\s+at|at\s+a\s+target\s+of)\b"
-        r"[^\n]{0,650}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^\n]{0,300}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
-        re.IGNORECASE,
-    ),
-    # "annual cash incentive award ... with a target value/payout of 275% of base salary"
-    re.compile(
-        r"\bannual\s+cash\s+incentive\s+award\b"
-        r"[^\n]{0,700}?\b(?:target\s+(?:payout|value|opportunity)\s+of|with\s+a\s+target\s+(?:payout|value|opportunity)\s+of|target(?:ed)?\s+at|equal\s+to|set\s+at|at\s+a\s+target\s+of)\b"
-        r"[^\n]{0,700}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^\n]{0,320}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
-        re.IGNORECASE,
-    ),
-    # "Short Term Incentive Plan/short-term cash incentive ... targeted at ... 250% of base salary"
-    re.compile(
-        r"\b(?:short\s*(?:-|\s)?term\s+(?:cash\s+)?incentive(?:\s+plan)?|sti\b)\b"
-        r"[^\n]{0,1800}?\btarget(?:ed)?\b"
-        r"[^\n]{0,1800}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^\n]{0,320}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
-        re.IGNORECASE,
-    ),
-    # "target incentive opportunity ... equal to 250% of base salary"
-    re.compile(
-        r"\btarget\s+(?:incentive|bonus)\s+opportunity\b"
-        r"[^\n]{0,500}?\b(?:equal\s+to|of|at|set\s+at)\b"
-        r"[^\n]{0,400}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
-        r"[^\n]{0,260}?\bof\b[^\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
-        re.IGNORECASE,
-    ),
-]
-
-
-
-TARGET_BONUS_USD_PATTERNS: List[re.Pattern] = [
-    # "target short-term incentive $3,250,000"
-    re.compile(
-        rf"\btarget\s+(?:short-?term\s+incentive|annual\s+incentive|cash\s+incentive|bonus)\b"
-        rf"[^.:\n]{{0,220}}?({DOLLAR_RE})",
-        re.IGNORECASE,
-    ),
-    # "target payout $X" (only when clearly cash incentive / bonus context is present)
-    re.compile(
-        rf"\btarget\s+payout\b[^.:\n]{{0,160}}?\b(?:cash\s+incentive|annual\s+incentive|short-?term\s+incentive|bonus)\b"
-        rf"[^.:\n]{{0,220}}?({DOLLAR_RE})",
-        re.IGNORECASE,
-    ),
-]
-SIGN_ON_CASH_PATTERNS: List[re.Pattern] = [
-    re.compile(rf"\b(?:sign(?:ing)?-?on\s+bonus|signing\s+bonus|sign-?on\s+bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE),
-]
-
-# Award context keywords
-EQUITY_KWS = (
-    "equity",
-    "long-term incentive",
-    "long term incentive",
-    "lti",
-    "ltip",
-    "long-term incentive equity",
-    "restricted stock",
-    "restricted stock unit",
-    "restricted stock units",
-    "stock unit",
-    "stock units",
-    "performance stock unit",
-    "performance stock units",
-    "performance share",
-    "psu",
-    "psus",
-    "rsu",
-    "rsus",
-    "pbrsu",
-    "performance-based restricted stock unit",
-    "performance-based restricted stock units",
-    "performance based restricted stock unit",
-    "performance based restricted stock units",
-    "stock option",
-    "stock options",
-    "option",
-    "options",
-    "grant date",
-    "grant-date",
-)
-
-
-CASH_KWS = (
-    "cash",
-    "payment",
-    "bonus",
-    "lump sum",
-    "make-whole payment",
-    "make whole payment",
-    "relocation",
-    "reimbursement",
-    "stipend",
-)
-
-ONE_TIME_KWS = (
-    "one-time",
-    "one time",
-    "signing",
-    "sign-on",
-    "sign on",
-    "inducement",
-    "make-whole",
-    "make whole",
-    "replacement",
-    "new hire",
-    "initial",
-    "commencement",
-    "start date",
-    "special",
-)
-
-# These phrases often indicate the *valuation* of an award (e.g., ASC 718 grant-date value),
-# but they do NOT, by themselves, tell you whether the award is annual/ongoing vs. one-time (sign-on/make-whole).
-# We use these only as "value signals" (for focus-window scoring / extraction), NOT as bucket signals.
-VALUE_SIGNAL_KWS = (
-    "grant date fair value",
-    "grant-date fair value",
-    "grant date value",
-    "grant-date value",
-    "grant value",
-    "award value",
-    "target award value",
-    "target grant date value",
-    "targeted grant date value",
-    "aggregate grant date fair value",
-    "aggregate grant date value",
-    "aggregate grant-date fair value",
-    "aggregate grant-date value",
-)
-
-COMPONENT_KWS = ("consisting of", "comprised of", "includes", "including", "consists of")
-TOTAL_KWS = ("aggregate", "total", "combined", "overall")
-
-
-SEVERANCE_PATTERNS: List[re.Pattern] = [
-    re.compile(r"\bseverance\b[^.:\n]{0,320}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE),
-    re.compile(r"\bchange in control\b[^.:\n]{0,340}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE),
-    re.compile(r"\bseverance\b[^.:\n]{0,340}?\b(\d(?:\.\d)?)\s?x\b", re.IGNORECASE),
-]
-
-
 def _dedupe(seq: List[str]) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
@@ -2531,11 +2517,11 @@ def process_filing(
     # ----
     # Detect executive appointment matches
     # ----
-    detected, _, matches = detect_exec_matches(primary_text, position_query=position_query)
+    detected, _, matches = detect_exec_matches(primary_text, position_query=position_query, company_name=filing.company_name)
 
     # If no match from the primary doc, try combined (primary + exhibits)
     if not matches and combined_text:
-        detected2, _, matches2 = detect_exec_matches(combined_text, position_query=position_query)
+        detected2, _, matches2 = detect_exec_matches(combined_text, position_query=position_query, company_name=filing.company_name)
         if detected2:
             matches = matches2
             detected = True
