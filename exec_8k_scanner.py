@@ -1383,6 +1383,14 @@ BASE_SALARY_PATTERNS: List[re.Pattern] = [
 
 # Target bonus / annual incentive patterns
 TARGET_BONUS_PCT_PATTERNS: List[re.Pattern] = [
+    # "target annual incentive bonus of no less than 150% of his base salary"
+    re.compile(
+        r"\btarget\s+annual\s+(?:cash\s+)?(?:incentive\s+)?bonus\b"
+        r"[^.:\n]{0,220}?\b(?:of|at|equal\s+to)\b"
+        r"[^.:\n]{0,80}?(?:no\s+less\s+than|at\s+least)?\s*(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^.:\n]{0,180}?\bof\b[^.:\n]{0,80}?\b(?:his|her|the)?\s*(?:annual\s+)?base\s+salary\b",
+        re.IGNORECASE,
+    ),
     # "annual cash incentive opportunity at a target of 150% of base salary"
     re.compile(
         r"\b(?:annual\s+cash\s+incentive|annual\s+incentive|cash\s+incentive|bonus\s+opportunity|short-?term\s+incentive)\b"
@@ -1609,6 +1617,14 @@ def _award_types_in_order(clause_low: str) -> List[str]:
 def _infer_award_types_for_clause(clause: str, money_matches: List[re.Match]) -> List[str]:
     clause_low = clause.lower()
 
+    # If a clause contains multiple equity award types (e.g., RSU + PSU) but only ONE $ amount,
+    # it is usually an aggregate / combined value (avoid labeling it as a single type).
+    if money_matches and len(money_matches) == 1:
+        types_in_clause = _award_types_in_order(clause_low)
+        if types_in_clause and len(set(types_in_clause)) >= 2:
+            return ["mixed"]
+
+
     # Special case: "RSUs and PSUs ... $X and $Y, respectively" => map values in order
     # to award types in order of first appearance.
     if "respectively" in clause_low and money_matches:
@@ -1658,7 +1674,24 @@ def _is_subset_amount(clause: str, mm: re.Match) -> bool:
 
 
 def _equity_bucket_for_context(clause_low: str, local_low: str) -> str:
-    # 1) Annual equity delivered as one-time “pre-grant” across multiple years (FactSet pattern)
+    """Bucket equity $ amounts into:
+      - one_time: sign-on / make-whole / inducement / replacement / other onboarding equity
+      - annual_target: ongoing/annual equity targets
+      - annual_advance: portion of a future year's annual equity pulled forward
+      - annual_pregrant: annual equity delivered as a one-time multi-year grant (in lieu of annual awards)
+    """
+
+    # --- Strong annual eligibility override (prevents one-time keywords elsewhere in the clause from
+    #     forcing all amounts into the one-time bucket; Hertz CEO example).
+    if (
+        re.search(r"\bcommencing\b[^.;\n]{0,80}\bfiscal\s+year\b", local_low)
+        or "eligibility to receive annual equity" in local_low
+        or "annual equity award for fiscal year" in local_low
+        or ("annual equity award" in local_low and re.search(r"\bfiscal\s+year\s+20\d{2}\b", local_low))
+    ):
+        return "annual_target"
+
+    # 1) Annual equity delivered as one-time “pre-grant” across multiple years (FactSet-style pattern)
     if (
         ("in lieu of" in clause_low and "annual" in clause_low and ("one-time" in clause_low or "one time" in clause_low))
         or (re.search(r"\bfiscal\s+year", clause_low) and "annual" in clause_low and ("one-time" in clause_low or "one time" in clause_low))
@@ -1674,13 +1707,29 @@ def _equity_bucket_for_context(clause_low: str, local_low: str) -> str:
     ):
         return "annual_advance"
 
-    # 3) Clear onboarding / make-whole / inducement language
-    if _contains_any(clause_low, ONE_TIME_KWS):
+    # 3) Local context classification (amount-level)
+    annual_near = _contains_any(local_low, ANNUAL_TARGET_KWS) or ("annual equity award" in local_low) or ("annual equity awards" in local_low)
+
+    # One-time signals are split into strong vs weak so that phrases like "initial annual equity award"
+    # don't get incorrectly bucketed as one-time purely due to the word "initial".
+    one_time_strong_kws = ("one-time", "one time", "sign-on", "sign on", "signing", "make-whole", "make whole", "inducement", "replacement", "makewhole")
+    one_time_weak_kws = ("new hire", "commencement", "initial", "special")
+
+    one_time_strong = any(k in local_low for k in one_time_strong_kws)
+    one_time_weak = any(k in local_low for k in one_time_weak_kws)
+
+    # Prefer annual targets when annual language is present and there isn't a strong one-time indicator.
+    if annual_near and not one_time_strong:
+        return "annual_target"
+
+    if one_time_strong:
         return "one_time"
 
-    # 4) Default equity bucket: annual/ongoing/target
-    return "annual_target"
+    if one_time_weak and not annual_near:
+        return "one_time"
 
+    # 4) Default equity bucket
+    return "annual_target"
 
 def _canonical_money_str(s: str) -> str:
     return money_norm(s)
@@ -1903,7 +1952,8 @@ def extract_compensation(text: str) -> ExtractedComp:
 
             # Equity if equity keywords near the amount (preferred)
             if mn["equity_near"]:
-                bucket = _equity_bucket_for_context(clause_low, local_low)
+                bucket_ctx_low = clause_low if len(money_matches) == 1 else local_low
+                bucket = _equity_bucket_for_context(clause_low, bucket_ctx_low)
                 _add_equity(bucket, amt_str, amt_usd, award_type, clause, clause_low)
                 comp.equity_awards.append(clause[:420])
                 comp.evidence_snippets.append(clause[:420])
